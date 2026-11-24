@@ -66,6 +66,8 @@ void complete(google::protobuf::Closure* done, rpc::Status& status, Operation op
         fail(status, rpc::CHUNK_FULL, e.what());
     } catch (const chunkstore::CapacityMismatch& e) {
         fail(status, rpc::CAPACITY_MISMATCH, e.what());
+    } catch (const chunkstore::LengthMismatch& e) {
+        fail(status, rpc::LENGTH_MISMATCH, e.what());
     } catch (const std::invalid_argument& e) {
         fail(status, rpc::INVALID_ARGUMENT, e.what());
     } catch (const std::out_of_range&) {
@@ -250,6 +252,14 @@ public:
                      rpc::FreezeResponse* response, google::protobuf::Closure* done) override {
         submit(controller, done, *response->mutable_status(), [this, request, response] {
             response->set_length(store_.freeze_chunk(request->chunk_id()));
+        }, &request->chunk_id());
+    }
+
+    void FreezeChunkAtLength(google::protobuf::RpcController* controller,
+                             const rpc::FreezeAtLengthRequest* request, rpc::FreezeResponse* response,
+                             google::protobuf::Closure* done) override {
+        submit(controller, done, *response->mutable_status(), [this, request, response] {
+            response->set_length(store_.freeze_chunk(request->chunk_id(), request->expected_length()));
         }, &request->chunk_id());
     }
 

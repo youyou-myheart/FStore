@@ -4,6 +4,8 @@
 #include "chunk_store.hpp"
 
 #include <butil/iobuf.h>
+#include <exception>
+#include <vector>
 
 namespace chunkstore {
 
@@ -51,10 +53,48 @@ public:
     std::uint64_t delete_chunk(std::string_view id) const;
     State restore_chunk(std::string_view id, std::uint64_t deleted_at_ns) const;
     std::uint64_t freeze_chunk(std::string_view id) const;
+    std::uint64_t freeze_chunk(std::string_view id, std::uint64_t expected_length) const;
 
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+};
+
+struct ReplicaReply {
+    std::string endpoint;
+    std::string acknowledgement;
+    std::exception_ptr error; // RpcError, RemoteChunkError or local exception, if any.
+};
+
+class ReplicaCommitError : public std::runtime_error {
+public:
+    explicit ReplicaCommitError(std::vector<ReplicaReply> replies);
+    const std::vector<ReplicaReply>& replies() const noexcept { return replies_; }
+private:
+    std::vector<ReplicaReply> replies_;
+};
+
+// Synchronous all-replica writes. Share across callers and assign offsets externally.
+class ReplicatedChunkClient {
+public:
+    explicit ReplicatedChunkClient(const std::vector<std::string>& endpoints, ClientOptions options = {});
+    ReplicatedChunkClient(const ReplicatedChunkClient&) = delete;
+    ReplicatedChunkClient& operator=(const ReplicatedChunkClient&) = delete;
+
+    State create_chunk(std::string_view id, std::uint64_t capacity) const;
+    AppendResult append(std::string_view id, std::uint64_t offset, std::string_view data,
+                        std::uint32_t wait_timeout_ms) const;
+    AppendResult append(std::string_view id, std::uint64_t offset, const butil::IOBuf& data,
+                        std::uint32_t wait_timeout_ms) const;
+    std::uint64_t freeze_chunk(std::string_view id, std::uint64_t expected_length) const;
+
+private:
+    struct Node {
+        std::string endpoint;
+        std::unique_ptr<ChunkClient> client;
+    };
+    std::vector<Node> nodes_;
+    template<class Operation> auto commit(const Operation& operation) const;
 };
 
 } // namespace chunkstore

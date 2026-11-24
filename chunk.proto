@@ -19,6 +19,7 @@ enum Code {
   REPAIR_CONFLICT = 12;
   REPAIR_FAILED = 13;
   RESTORE_CONFLICT = 14;
+  LENGTH_MISMATCH = 15;
 }
 
 message Status {
@@ -86,6 +87,11 @@ message FreezeResponse {
   uint64 length = 2;
 }
 
+message FreezeAtLengthRequest {
+  string chunk_id = 1;
+  uint64 expected_length = 2;
+}
+
 enum CopyPriority {
   NORMAL = 0;
   HIGH = 1;
@@ -140,4 +146,5 @@ service ChunkService {
   rpc DeleteChunk(ChunkRequest) returns (DeleteResponse);
   rpc RestoreChunk(RestoreRequest) returns (RestoreResponse);
   rpc FreezeChunk(ChunkRequest) returns (FreezeResponse);
+  rpc FreezeChunkAtLength(FreezeAtLengthRequest) returns (FreezeResponse);
 }

@@ -778,12 +778,21 @@ State ChunkStore::restore_chunk(std::string_view id, std::uint64_t timestamp) {
 }
 
 std::uint64_t ChunkStore::freeze_chunk(std::string_view id) {
+    return freeze_chunk(id, std::nullopt);
+}
+
+std::uint64_t ChunkStore::freeze_chunk(std::string_view id, std::optional<std::uint64_t> expected_length) {
     const auto handle = impl_->find(id);
     auto& chunk = *handle;
     std::lock_guard lock(chunk.writer);
     chunk.check_writable();
     if (!chunk.ready.load(std::memory_order_relaxed)) {
         system_failure("chunk not found", ENOENT);
+    }
+    const auto length = chunk.length.load(std::memory_order_relaxed);
+    if (expected_length && length != *expected_length) {
+        throw LengthMismatch("expected length " + std::to_string(*expected_length) +
+                             ", stored length " + std::to_string(length));
     }
     if (chunk.state == State::Open) {
         chunk.write_failed = true;
@@ -794,7 +803,7 @@ std::uint64_t ChunkStore::freeze_chunk(std::string_view id) {
         sync_directory(chunk.directory);
         chunk.write_failed = false;
     }
-    return chunk.length.load(std::memory_order_relaxed);
+    return length;
 }
 
 } // namespace chunkstore

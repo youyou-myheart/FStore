@@ -67,6 +67,11 @@ public:
     using std::invalid_argument::invalid_argument;
 };
 
+class LengthMismatch : public std::logic_error {
+public:
+    using std::logic_error::logic_error;
+};
+
 // Owns an existing Linux directory. IDs are 32 lowercase hex digits.
 // Operations are thread-safe. Finish them before destroying the store.
 class ChunkStore {
@@ -96,6 +101,7 @@ public:
     std::uint64_t delete_chunk(std::string_view id);
     State restore_chunk(std::string_view id, std::uint64_t deleted_at_ns);
     std::uint64_t freeze_chunk(std::string_view id);
+    std::uint64_t freeze_chunk(std::string_view id, std::optional<std::uint64_t> expected_length);
 
 private:
     struct Impl;

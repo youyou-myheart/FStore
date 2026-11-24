@@ -15,6 +15,52 @@ std::uint64_t number(std::string_view text) {
     }
     return value;
 }
+
+template<class Client>
+void write_chunk(const Client& client, std::string_view command, char** argv) {
+    const auto* id = argv[3];
+    if (command == "create") {
+        std::cout << (client.create_chunk(id, number(argv[4])) == chunkstore::State::Open
+                          ? "open" : "frozen") << '\n';
+    } else if (command == "append") {
+        const auto expected_offset = number(argv[4]);
+        const auto wait = number(argv[5]);
+        if (wait > chunkstore::max_gap_wait_ms) {
+            throw std::invalid_argument("WAIT_MS must be in 0..60000");
+        }
+        std::ifstream file;
+        std::istream* input = &std::cin;
+        if (std::string_view(argv[6]) != "-") {
+            file.open(argv[6], std::ios::binary);
+            if (!file) {
+                throw std::runtime_error("could not open append input");
+            }
+            input = &file;
+        }
+        std::string data(chunkstore::max_rpc_payload + 1, '\0');
+        input->read(data.data(), data.size());
+        if (input->bad() || (input->fail() && !input->eof())) {
+            throw std::runtime_error("could not read append input");
+        }
+        data.resize(input->gcount());
+        const auto [offset, length] = client.append(
+            id, expected_offset, data, static_cast<std::uint32_t>(wait));
+        std::cout << offset << ' ' << length << '\n';
+    } else {
+        std::cout << client.freeze_chunk(id, number(argv[4])) << '\n';
+    }
+}
+
+std::vector<std::string> split_replicas(std::string_view list) {
+    std::vector<std::string> endpoints;
+    for (;;) {
+        const auto comma = list.find(',');
+        endpoints.emplace_back(list.substr(0, comma));
+        if (comma == list.npos) return endpoints;
+        list.remove_prefix(comma + 1);
+    }
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -22,7 +68,7 @@ int main(int argc, char** argv) {
     const bool valid = (command == "stats" && argc == 3) ||
                        ((command == "create" || command == "restore") && argc == 5) ||
                        (command == "repair" && (argc == 5 || argc == 6)) ||
-                       ((command == "freeze" || command == "delete") && argc == 4) ||
+                       (command == "freeze" && (argc == 4 || argc == 5)) || (command == "delete" && argc == 4) ||
                        (command == "append" && argc == 7) || (command == "read" && argc == 6);
     if (!valid) {
         std::cerr << "usage: chunk_cli ENDPOINT create ID CAPACITY_BYTES\n"
@@ -32,10 +78,23 @@ int main(int argc, char** argv) {
                      "       chunk_cli ENDPOINT delete ID\n"
                      "       chunk_cli ENDPOINT restore ID DELETED_AT_NS\n"
                      "       chunk_cli ENDPOINT stats\n"
-                     "       chunk_cli ENDPOINT freeze ID\n";
+                     "       chunk_cli ENDPOINT freeze ID [EXPECTED_LENGTH]\n"
+                     "       chunk_cli HOST:PORT,HOST:PORT,... create ID CAPACITY_BYTES\n"
+                     "       chunk_cli HOST:PORT,HOST:PORT,... append ID OFFSET WAIT_MS FILE|-\n"
+                     "       chunk_cli HOST:PORT,HOST:PORT,... freeze ID EXPECTED_LENGTH\n";
         return EXIT_FAILURE;
     }
     try {
+        const std::string_view endpoints = argv[1];
+        if (endpoints.find(',') != endpoints.npos) {
+            if (command != "append" && command != "create" && !(command == "freeze" && argc == 5)) {
+                throw std::invalid_argument("replica list supports create, append and freeze ID EXPECTED_LENGTH");
+            }
+            chunkstore::ReplicatedChunkClient client(split_replicas(endpoints));
+            write_chunk(client, command, argv);
+            std::cout.flush();
+            return std::cout ? EXIT_SUCCESS : EXIT_FAILURE;
+        }
         chunkstore::ChunkClient client(argv[1]);
         if (command == "stats") {
             std::cout << client.traffic_stats().DebugString();
@@ -54,33 +113,8 @@ int main(int argc, char** argv) {
             else if (label == "low") priority = chunkstore::rpc::v1::LOW;
             else if (label != "normal") throw std::invalid_argument("invalid replication priority");
             std::cout << client.repair_chunk(id, argv[4], priority) << '\n';
-        } else if (command == "create") {
-            std::cout << (client.create_chunk(id, number(argv[4])) == chunkstore::State::Open
-                              ? "open" : "frozen") << '\n';
-        } else if (command == "append") {
-            const auto expected_offset = number(argv[4]);
-            const auto wait = number(argv[5]);
-            if (wait > chunkstore::max_gap_wait_ms) {
-                throw std::invalid_argument("WAIT_MS must be in 0..60000");
-            }
-            std::ifstream file;
-            std::istream* input = &std::cin;
-            if (std::string_view(argv[6]) != "-") {
-                file.open(argv[6], std::ios::binary);
-                if (!file) {
-                    throw std::runtime_error("could not open append input");
-                }
-                input = &file;
-            }
-            std::string data(chunkstore::max_rpc_payload + 1, '\0');
-            input->read(data.data(), data.size());
-            if (input->bad() || (input->fail() && !input->eof())) {
-                throw std::runtime_error("could not read append input");
-            }
-            data.resize(input->gcount());
-            const auto [offset, length] = client.append(
-                id, expected_offset, data, static_cast<std::uint32_t>(wait));
-            std::cout << offset << ' ' << length << '\n';
+        } else if (command == "create" || command == "append" || (command == "freeze" && argc == 5)) {
+            write_chunk(client, command, argv);
         } else if (command == "read") {
             const auto length = number(argv[5]);
             if (length > chunkstore::max_rpc_payload) {

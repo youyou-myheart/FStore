@@ -3,10 +3,14 @@
 
 #include <brpc/channel.h>
 #include <brpc/controller.h>
+#include <bthread/bthread.h>
+#include <butil/endpoint.h>
 
 #include <algorithm>
 #include <cerrno>
 #include <limits>
+#include <set>
+#include <type_traits>
 
 namespace chunkstore {
 namespace {
@@ -15,6 +19,22 @@ namespace wire = rpc::v1;
 void check_size(std::size_t size) {
     if (size > max_rpc_payload) {
         throw std::length_error("RPC payload exceeds 8 MiB");
+    }
+}
+
+butil::IOBuf append_buffer(std::string_view data) {
+    check_size(data.size());
+    butil::IOBuf buffer;
+    if (!data.empty() && buffer.append(data.data(), data.size()) != 0) {
+        throw std::bad_alloc();
+    }
+    return buffer;
+}
+
+void check_append(std::size_t size, std::uint32_t wait_timeout_ms) {
+    check_size(size);
+    if (wait_timeout_ms > max_gap_wait_ms || size == 0) {
+        throw std::invalid_argument("append requires non-empty data and a timeout of 0..60000 ms");
     }
 }
 
@@ -98,20 +118,12 @@ State ChunkClient::create_chunk(std::string_view id, std::uint64_t capacity) con
 
 AppendResult ChunkClient::append(std::string_view id, std::uint64_t offset,
                                  std::string_view data, std::uint32_t wait_timeout_ms) const {
-    check_size(data.size());
-    butil::IOBuf buffer;
-    if (!data.empty() && buffer.append(data.data(), data.size()) != 0) {
-        throw std::bad_alloc();
-    }
-    return append(id, offset, buffer, wait_timeout_ms);
+    return append(id, offset, append_buffer(data), wait_timeout_ms);
 }
 
 AppendResult ChunkClient::append(std::string_view id, std::uint64_t offset,
                                  const butil::IOBuf& data, std::uint32_t wait_timeout_ms) const {
-    check_size(data.size());
-    if (wait_timeout_ms > max_gap_wait_ms || data.empty()) {
-        throw std::invalid_argument("append requires non-empty data and a timeout of 0..60000 ms");
-    }
+    check_append(data.size(), wait_timeout_ms);
     wire::AppendRequest request;
     wire::AppendResponse response;
     brpc::Controller controller;
@@ -181,6 +193,151 @@ std::uint64_t ChunkClient::freeze_chunk(std::string_view id) const {
     impl_->stub.FreezeChunk(&controller, &request, &response, nullptr);
     check_response(controller, response);
     return response.length();
+}
+
+std::uint64_t ChunkClient::freeze_chunk(std::string_view id, std::uint64_t expected_length) const {
+    wire::FreezeAtLengthRequest request;
+    wire::FreezeResponse response;
+    brpc::Controller controller;
+    request.set_chunk_id(std::string(id));
+    request.set_expected_length(expected_length);
+    impl_->stub.FreezeChunkAtLength(&controller, &request, &response, nullptr);
+    check_response(controller, response);
+    if (response.length() != expected_length) throw RpcError(EPROTO, "freeze response length mismatch");
+    return response.length();
+}
+
+namespace {
+std::string describe(State state) { return state == State::Open ? "open" : "frozen"; }
+std::string describe(std::uint64_t length) { return std::to_string(length); }
+
+std::string describe_replies(const std::vector<ReplicaReply>& replies) {
+    std::string message = "replica commit incomplete";
+    for (const auto& reply : replies) {
+        message += "\n  " + reply.endpoint + " ";
+        if (!reply.error) {
+            message += "ack " + reply.acknowledgement;
+            continue;
+        }
+        try {
+            std::rethrow_exception(reply.error);
+        } catch (const RemoteChunkError& e) {
+            message += "chunk error (" + std::to_string(e.code()) + "): " + e.what();
+        } catch (const RpcError& e) {
+            message += "RPC error (" + std::to_string(e.code()) + "): " + e.what();
+        } catch (const std::exception& e) {
+            message += e.what();
+        } catch (...) {
+            message += "unknown error";
+        }
+    }
+    return message;
+}
+}
+
+ReplicaCommitError::ReplicaCommitError(std::vector<ReplicaReply> replies)
+    : std::runtime_error(describe_replies(replies)), replies_(std::move(replies)) {}
+
+ReplicatedChunkClient::ReplicatedChunkClient(const std::vector<std::string>& endpoints, ClientOptions options) {
+    if (endpoints.empty()) throw std::invalid_argument("at least one replica is required");
+    std::set<std::string> resolved;
+    for (const auto& endpoint : endpoints) {
+        butil::EndPoint address;
+        if (endpoint.empty() || endpoint.find('\0') != std::string::npos ||
+            (butil::str2endpoint(endpoint.c_str(), &address) != 0 &&
+             butil::hostname2endpoint(endpoint.c_str(), &address) != 0)) {
+            throw std::invalid_argument("invalid replica endpoint: " + endpoint);
+        }
+        const std::string target = butil::endpoint2str(address).c_str();
+        if (!resolved.insert(target).second) throw std::invalid_argument("duplicate replica: " + endpoint);
+        nodes_.push_back({endpoint, std::make_unique<ChunkClient>(target, options)});
+    }
+}
+
+template<class Operation>
+auto ReplicatedChunkClient::commit(const Operation& operation) const {
+    using Value = std::invoke_result_t<Operation, const ChunkClient&>;
+    struct Call {
+        const ChunkClient* client;
+        const Operation* operation;
+        Value value{};
+        std::exception_ptr error;
+        bthread_t thread{};
+        bool started = false;
+    };
+    std::vector<Call> calls(nodes_.size());
+    auto run = [](void* arg) -> void* {
+        auto& call = *static_cast<Call*>(arg);
+        try {
+            call.value = (*call.operation)(*call.client);
+        } catch (...) {
+            call.error = std::current_exception();
+        }
+        return nullptr;
+    };
+    // Allocate before launching. The calling thread handles the last replica.
+    for (std::size_t i = 0; i < calls.size(); ++i) {
+        auto& call = calls[i];
+        call.client = nodes_[i].client.get();
+        call.operation = &operation;
+        if (i + 1 < calls.size()) {
+            call.started = bthread_start_background(&call.thread, nullptr, run, &call) == 0;
+        }
+    }
+    for (auto& call : calls) {
+        if (!call.started) run(&call);
+    }
+    for (const auto& call : calls) {
+        if (call.started) bthread_join(call.thread, nullptr);
+    }
+    const auto value = calls.front().value;
+    const bool agreed = std::all_of(calls.begin(), calls.end(), [value](const Call& call) {
+        return !call.error && call.value == value;
+    });
+    if (agreed) return value;
+
+    std::vector<ReplicaReply> replies;
+    for (std::size_t i = 0; i < calls.size(); ++i) {
+        const auto& call = calls[i];
+        replies.push_back({nodes_[i].endpoint, call.error ? "" : describe(call.value), call.error});
+    }
+    throw ReplicaCommitError(std::move(replies));
+}
+
+State ReplicatedChunkClient::create_chunk(std::string_view id, std::uint64_t capacity) const {
+    return commit([&](const ChunkClient& client) { return client.create_chunk(id, capacity); });
+}
+
+AppendResult ReplicatedChunkClient::append(std::string_view id, std::uint64_t offset,
+                                           std::string_view data, std::uint32_t wait_timeout_ms) const {
+    return append(id, offset, append_buffer(data), wait_timeout_ms);
+}
+
+AppendResult ReplicatedChunkClient::append(std::string_view id, std::uint64_t offset,
+                                           const butil::IOBuf& data, std::uint32_t wait_timeout_ms) const {
+    check_append(data.size(), wait_timeout_ms);
+    const auto length = commit([&](const ChunkClient& client) -> std::uint64_t {
+        wire::Code conflict;
+        try {
+            return client.append(id, offset, data, wait_timeout_ms).length;
+        } catch (const RemoteChunkError& e) {
+            if (e.code() != wire::OFFSET_CONFLICT && e.code() != wire::FROZEN) throw;
+            conflict = e.code();
+        }
+        // A previous attempt may have committed before its acknowledgement was lost.
+        try {
+            if (client.read_chunk(id, offset, data.size()).equals(data)) return data.size();
+        } catch (const RemoteChunkError& e) {
+            if (e.code() != wire::OUT_OF_RANGE) throw;
+            throw RemoteChunkError(conflict, "requested range is not fully committed");
+        }
+        throw RemoteChunkError(conflict, "committed bytes differ at the requested range");
+    });
+    return {offset, length};
+}
+
+std::uint64_t ReplicatedChunkClient::freeze_chunk(std::string_view id, std::uint64_t expected_length) const {
+    return commit([&](const ChunkClient& client) { return client.freeze_chunk(id, expected_length); });
 }
 
 } // namespace chunkstore

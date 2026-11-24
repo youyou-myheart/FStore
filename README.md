@@ -43,6 +43,35 @@ const auto data = client.read_chunk(id, offset, length);  // butil::IOBuf
 client.freeze_chunk(id);
 ```
 
+### 多副本提交
+
+用逗号指定同一 Chunk 的副本地址。客户端并发发出请求，每个地址复用一个 bRPC 通道，所有副本都确认后才返回成功。可将每台 server 部署在不同主机上。
+
+```sh
+replicas=10.0.0.1:8080,10.0.0.2:8080,10.0.0.3:8080
+id=0123456789abcdef0123456789abcdef
+./build/chunk_cli "$replicas" create "$id" 1048576
+printf 'hello' | ./build/chunk_cli "$replicas" append "$id" 0 1000 -
+./build/chunk_cli "$replicas" freeze "$id" 5
+./build/chunk_cli 10.0.0.2:8080 read "$id" 0 5
+```
+
+C++ 应用包含 `chunk_client.hpp`，链接 `chunk_client`。
+
+```cpp
+chunkstore::ReplicatedChunkClient client({"10.0.0.1:8080", "10.0.0.2:8080", "10.0.0.3:8080"});
+client.create_chunk(id, 1048576);
+const auto [offset, length] = client.append(id, 0, "hello", 1000);
+client.freeze_chunk(id, offset + length);
+```
+
+- **创建**会检查每个副本的容量和返回状态。容量相同、状态一致的重复创建可成功。客户端拒绝解析到同一地址和端口的重复副本。调用方负责把地址映射到独立的存储节点。
+- **追加**向所有副本发送相同的偏移、数据和乱序等待时间。正常写入每个节点只需一次 RPC，多个 attachment 共享客户端的 `IOBuf` 数据块。多个线程可共用一个客户端，由调用方统一分配各 Chunk 的字节范围。
+- **部分失败**时，已落盘的字节继续保留且可读。CLI 返回非零并列出每台节点的结果，SDK 抛出 `ReplicaCommitError`，其 `replies()` 按地址输入顺序记录确认值或异常。传输错误表示结果未知。重试时使用相同的 Chunk ID、副本列表、偏移和原始数据。遇到已占用的偏移或已封存的副本，客户端会读回该范围，逐字节一致才计为确认。整个重试期间应保留同一代 Chunk，并保证每个偏移只分配给一份数据。
+- **封存**时传入已提交的最终长度。每个节点在写锁内核对自己的长度，相符才封存。落后的副本可补写后重试，已按该长度封存的副本会重复确认。此操作使用新增的 `FreezeChunkAtLength` RPC，多副本封存前须升级对应节点。
+
+运行 `python3 tests/replicated_client.py build` 可验证三个独立 server 的并发写入、节点掉线与恢复、重复提交、冲突检测和条件封存。
+
 ## 协议语义
 
 | RPC | 请求 | 成功结果 |
@@ -51,6 +80,7 @@ client.freeze_chunk(id);
 | `Append` | Chunk ID、预期字节偏移、字节数、等待超时（毫秒）、请求 attachment | 起始偏移和追加长度 |
 | `ReadChunk` | Chunk ID、偏移、长度 | 响应 attachment 中的原始字节 |
 | `FreezeChunk` | Chunk ID | 最终字节长度，重复封存返回相同长度 |
+| `FreezeChunkAtLength` | Chunk ID、预期最终字节长度 | 长度匹配时封存并返回长度，长度有差异时返回 `LENGTH_MISMATCH` |
 | `DeleteChunk` | Chunk ID | 本次删除的 Unix 纳秒时间戳，用于恢复 |
 | `RestoreChunk` | Chunk ID、删除时间戳 | 恢复后的 OPEN 或 FROZEN 状态 |
 
