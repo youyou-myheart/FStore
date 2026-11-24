@@ -1,0 +1,143 @@
+syntax = "proto3";
+
+package chunkstore.rpc.v1;
+option cc_generic_services = true;
+
+enum Code {
+  OK = 0;
+  INVALID_ARGUMENT = 1;
+  NOT_FOUND = 2;
+  FROZEN = 3;
+  OUT_OF_RANGE = 4;
+  TOO_LARGE = 5;
+  WRITE_UNAVAILABLE = 6;
+  STORAGE_ERROR = 7;
+  CHUNK_FULL = 8;
+  CAPACITY_MISMATCH = 9;
+  OFFSET_CONFLICT = 10;
+  GAP_TIMEOUT = 11;
+  REPAIR_CONFLICT = 12;
+  REPAIR_FAILED = 13;
+  RESTORE_CONFLICT = 14;
+}
+
+message Status {
+  Code code = 1;
+  string message = 2;
+}
+
+message ChunkRequest {
+  string chunk_id = 1;
+}
+
+message CreateRequest {
+  string chunk_id = 1;
+  uint64 capacity = 2;
+}
+
+message CreateResponse {
+  Status status = 1;
+  bool frozen = 2;
+  uint64 capacity = 3;
+}
+
+// Append payload is carried in the bRPC request attachment.
+message AppendRequest {
+  string chunk_id = 1;
+  uint64 length = 2;
+  optional uint64 offset = 3;
+  optional uint32 wait_timeout_ms = 4;
+}
+
+message AppendResponse {
+  Status status = 1;
+  uint64 offset = 2;
+  uint64 length = 3;
+}
+
+message ReadRequest {
+  string chunk_id = 1;
+  uint64 offset = 2;
+  uint64 length = 3;
+}
+
+// Read payload is carried in the bRPC response attachment.
+message ReadResponse {
+  Status status = 1;
+}
+
+message DeleteResponse {
+  Status status = 1;
+  uint64 deleted_at_ns = 2;
+}
+
+message RestoreRequest {
+  string chunk_id = 1;
+  uint64 deleted_at_ns = 2;
+}
+
+message RestoreResponse {
+  Status status = 1;
+  bool frozen = 2;
+}
+
+message FreezeResponse {
+  Status status = 1;
+  uint64 length = 2;
+}
+
+enum CopyPriority {
+  NORMAL = 0;
+  HIGH = 1;
+  LOW = 2;
+}
+
+message RepairRequest {
+  string chunk_id = 1;
+  string destination = 2;
+  CopyPriority priority = 3;
+}
+
+message RepairResponse {
+  Status status = 1;
+  uint64 length = 2;
+  uint32 suggested_block_bytes = 3;
+}
+
+message RepairBlock {
+  string chunk_id = 1;
+  string transfer_id = 2;
+  uint64 capacity = 3;
+  uint64 total_length = 4;
+  bool frozen = 5;
+  uint64 offset = 6;
+  fixed32 crc32c = 7;
+  bool abort = 8;
+  CopyPriority priority = 9;
+}
+
+message TrafficStatsRequest {}
+message LaneStats {
+  uint64 granted_bytes = 1;
+  uint64 pending = 2;
+}
+message TrafficStatsResponse {
+  uint64 bytes_per_second = 1;
+  LaneStats online = 2;
+  LaneStats trash = 3;
+  LaneStats copy_normal = 4;
+  LaneStats copy_high = 5;
+  LaneStats copy_low = 6;
+}
+
+service ChunkService {
+  rpc GetTrafficStats(TrafficStatsRequest) returns (TrafficStatsResponse);
+  rpc RepairChunk(RepairRequest) returns (RepairResponse);
+  rpc ReceiveRepairBlock(RepairBlock) returns (RepairResponse);
+  rpc CreateChunk(CreateRequest) returns (CreateResponse);
+  rpc Append(AppendRequest) returns (AppendResponse);
+  rpc ReadChunk(ReadRequest) returns (ReadResponse);
+  rpc DeleteChunk(ChunkRequest) returns (DeleteResponse);
+  rpc RestoreChunk(RestoreRequest) returns (RestoreResponse);
+  rpc FreezeChunk(ChunkRequest) returns (FreezeResponse);
+}

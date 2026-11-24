@@ -1,0 +1,690 @@
+#include "chunk_store.hpp"
+#include "chunk_repair.hpp"
+#include "chunk_rpc_limits.hpp"
+#include "chunk.pb.h"
+
+#include <brpc/closure_guard.h>
+#include <brpc/controller.h>
+#include <brpc/server.h>
+#include <brpc/protocol.h>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <deque>
+#include <charconv>
+#include <chrono>
+#include <condition_variable>
+#include <functional>
+#include <cstdlib>
+#include <iostream>
+#include <list>
+#include <mutex>
+#include <system_error>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+namespace {
+namespace rpc = chunkstore::rpc::v1;
+using chunkstore::TrafficLane;
+
+class CountedDone final : public google::protobuf::Closure {
+public:
+    CountedDone(std::atomic<unsigned>& count, google::protobuf::Closure* done)
+        : count_(count), done_(done) {}
+    void Run() override {
+        auto* done = done_;
+        --count_;
+        delete this;
+        done->Run();
+    }
+private:
+    std::atomic<unsigned>& count_;
+    google::protobuf::Closure* done_;
+};
+
+void fail(rpc::Status& status, rpc::Code code, const char* message) {
+    status.set_code(code);
+    status.set_message(message);
+}
+
+template<class Operation>
+void complete(google::protobuf::Closure* done, rpc::Status& status, Operation operation) {
+    brpc::ClosureGuard guard(done);
+    try {
+        operation();
+    } catch (const chunkstore::RestoreConflict& e) {
+        fail(status, rpc::RESTORE_CONFLICT, e.what());
+    } catch (const chunkstore::RepairConflict& e) {
+        fail(status, rpc::REPAIR_CONFLICT, e.what());
+    } catch (const chunkstore::ChunkFrozen&) {
+        fail(status, rpc::FROZEN, "chunk is frozen");
+    } catch (const chunkstore::WriteUnavailable& e) {
+        fail(status, rpc::WRITE_UNAVAILABLE, e.what());
+    } catch (const chunkstore::ChunkFull& e) {
+        fail(status, rpc::CHUNK_FULL, e.what());
+    } catch (const chunkstore::CapacityMismatch& e) {
+        fail(status, rpc::CAPACITY_MISMATCH, e.what());
+    } catch (const std::invalid_argument& e) {
+        fail(status, rpc::INVALID_ARGUMENT, e.what());
+    } catch (const std::out_of_range&) {
+        fail(status, rpc::OUT_OF_RANGE, "read exceeds published chunk length");
+    } catch (const std::length_error&) {
+        fail(status, rpc::TOO_LARGE, "chunk size limit exceeded");
+    } catch (const std::system_error& e) {
+        if (e.code() == std::errc::no_such_file_or_directory) {
+            fail(status, rpc::NOT_FOUND, "chunk not found");
+        } else {
+            fail(status, rpc::STORAGE_ERROR, "storage I/O failed");
+        }
+    } catch (const std::exception&) {
+        fail(status, rpc::STORAGE_ERROR, "service operation failed");
+    }
+}
+
+class Service final : public rpc::ChunkService {
+public:
+    Service(chunkstore::ChunkStore& store, unsigned workers, unsigned concurrency)
+        : store_(store), repairs_(store), online_limit_(concurrency), waiting_limit_(concurrency / 2) {
+        for (unsigned i = 0; i < senders_.size(); ++i) {
+            senders_[i] = std::jthread([this, i](std::stop_token stop) {
+                auto& queue = sends_[i];
+                std::unique_lock lock(sender_mutex_);
+                while (sender_available_.wait(lock, stop, [&] { return !queue.empty(); })) {
+                    auto job = std::move(queue.front());
+                    queue.pop_front();
+                    lock.unlock();
+                    job();
+                    lock.lock();
+                }
+            });
+        }
+        workers_.reserve(workers);
+        for (unsigned i = 0; i < workers; ++i) {
+            workers_.emplace_back([this](std::stop_token stop) { work(stop); });
+        }
+    }
+
+    void GetTrafficStats(google::protobuf::RpcController* controller, const rpc::TrafficStatsRequest*,
+                         rpc::TrafficStatsResponse* response, google::protobuf::Closure* done) override {
+        brpc::ClosureGuard guard(done);
+        if (!accept_protocol(*static_cast<brpc::Controller*>(controller))) return;
+        const auto stats = store_.traffic().stats();
+        response->set_bytes_per_second(stats.bytes_per_second);
+        const std::array lanes{response->mutable_online(), response->mutable_trash(),
+                               response->mutable_copy_normal(), response->mutable_copy_high(),
+                               response->mutable_copy_low()};
+        for (std::size_t i = 0; i < lanes.size(); ++i) {
+            lanes[i]->set_granted_bytes(stats.granted[i]);
+            lanes[i]->set_pending(stats.pending[i]);
+        }
+    }
+
+    void RepairChunk(google::protobuf::RpcController* controller, const rpc::RepairRequest* request,
+                     rpc::RepairResponse* response, google::protobuf::Closure* done) override {
+        brpc::ClosureGuard guard(done);
+        if (!accept_protocol(*static_cast<brpc::Controller*>(controller))) {
+            return;
+        }
+        auto& status = *response->mutable_status();
+        if (!rpc::CopyPriority_IsValid(request->priority())) {
+            fail(status, rpc::INVALID_ARGUMENT, "invalid replication priority");
+            return;
+        }
+        try {
+            std::lock_guard lock(sender_mutex_);
+            auto& queue = sends_[request->priority()];
+            if (queue.size() >= 4) {
+                fail(status, rpc::WRITE_UNAVAILABLE, "replication priority queue is full");
+                return;
+            }
+            queue.emplace_back([this, request, response, done, &status] {
+                complete(done, status, [&] { chunkstore::push_replica(store_, *request, *response); });
+            });
+            guard.release();
+            sender_available_.notify_all();
+        } catch (const std::exception& e) {
+            fail(status, rpc::REPAIR_FAILED, e.what());
+        }
+    }
+
+    void ReceiveRepairBlock(google::protobuf::RpcController* controller, const rpc::RepairBlock* block,
+                            rpc::RepairResponse* response, google::protobuf::Closure* done) override {
+        if (!rpc::CopyPriority_IsValid(block->priority())) {
+            brpc::ClosureGuard guard(done);
+            fail(*response->mutable_status(), rpc::INVALID_ARGUMENT, "invalid replication priority");
+            return;
+        }
+        const auto bytes = static_cast<brpc::Controller*>(controller)->request_attachment().size();
+        submit(controller, done, *response->mutable_status(), [this, controller, block, response] {
+            auto& call = *static_cast<brpc::Controller*>(controller);
+            response->set_length(repairs_.receive(*block, call.request_attachment()));
+            response->set_suggested_block_bytes(chunkstore::repair_block_size(store_.traffic()));
+        }, &block->chunk_id(), chunkstore::copy_lane(block->priority()), bytes);
+    }
+
+    void CreateChunk(google::protobuf::RpcController* controller, const rpc::CreateRequest* request,
+                     rpc::CreateResponse* response, google::protobuf::Closure* done) override {
+        submit(controller, done, *response->mutable_status(), [this, request, response] {
+            response->set_frozen(store_.create_chunk(request->chunk_id(), request->capacity()) ==
+                                 chunkstore::State::Frozen);
+            response->set_capacity(request->capacity());
+        }, &request->chunk_id());
+    }
+
+    void Append(google::protobuf::RpcController* controller, const rpc::AppendRequest* request,
+                rpc::AppendResponse* response, google::protobuf::Closure* done) override {
+        auto& status = *response->mutable_status();
+        brpc::ClosureGuard guard(done);
+        auto& call = *static_cast<brpc::Controller*>(controller);
+        if (!accept_protocol(call)) {
+            return;
+        }
+        const auto& data = call.request_attachment();
+        if (request->length() > chunkstore::max_rpc_payload ||
+            data.size() > chunkstore::max_rpc_payload) {
+            fail(status, rpc::TOO_LARGE, "append exceeds RPC payload limit");
+            return;
+        }
+        if (request->length() != data.size()) {
+            fail(status, rpc::INVALID_ARGUMENT, "append attachment length mismatch");
+            return;
+        }
+        if (!request->has_offset() || !request->has_wait_timeout_ms() || data.empty() ||
+            request->wait_timeout_ms() > chunkstore::max_gap_wait_ms) {
+            fail(status, rpc::INVALID_ARGUMENT, "append requires offset, timeout (0..60000 ms), and data");
+            return;
+        }
+        const auto timeout = request->wait_timeout_ms();
+        const auto deadline = timeout == 0 ? Clock::time_point::max() :
+            Clock::now() + std::chrono::milliseconds(timeout);
+        done = reserve(guard, done, status, TrafficLane::Online);
+        if (done) admit(guard, status, &request->chunk_id(),
+                        Job{{}, &data, response, done, request->offset(), deadline},
+                        done, TrafficLane::Online, data.size());
+    }
+
+    void ReadChunk(google::protobuf::RpcController* controller, const rpc::ReadRequest* request,
+                   rpc::ReadResponse* response, google::protobuf::Closure* done) override {
+        auto& status = *response->mutable_status();
+        submit(controller, done, status, [this, controller, request, response, &status] {
+            if (request->length() > chunkstore::max_rpc_payload) {
+                fail(status, rpc::TOO_LARGE, "read exceeds RPC payload limit");
+                return;
+            }
+            const auto length = static_cast<std::size_t>(request->length());
+            auto* brpc_controller = static_cast<brpc::Controller*>(controller);
+            if (length == 0) {
+                store_.read_chunk(request->chunk_id(), request->offset(), std::span<char>{});
+                return;
+            }
+            auto data = std::make_unique_for_overwrite<char[]>(length);
+            store_.read_chunk(request->chunk_id(), request->offset(), std::span(data.get(), length));
+            if (brpc_controller->response_attachment().append_user_data(
+                    data.get(), length, [](void* p) { delete[] static_cast<char*>(p); }) != 0) {
+                fail(status, rpc::STORAGE_ERROR, "could not attach read data");
+                return;
+            }
+            data.release();
+        }, nullptr, TrafficLane::Online, std::min<std::uint64_t>(request->length(), chunkstore::max_rpc_payload));
+    }
+
+    void DeleteChunk(google::protobuf::RpcController* controller, const rpc::ChunkRequest* request,
+                     rpc::DeleteResponse* response, google::protobuf::Closure* done) override {
+        submit(controller, done, *response->mutable_status(), [this, request, response] {
+            response->set_deleted_at_ns(store_.delete_chunk(request->chunk_id()));
+            repairs_.discard(request->chunk_id());
+        }, &request->chunk_id());
+    }
+
+    void RestoreChunk(google::protobuf::RpcController* controller, const rpc::RestoreRequest* request,
+                      rpc::RestoreResponse* response, google::protobuf::Closure* done) override {
+        submit(controller, done, *response->mutable_status(), [this, request, response] {
+            response->set_frozen(store_.restore_chunk(request->chunk_id(), request->deleted_at_ns()) ==
+                                 chunkstore::State::Frozen);
+        }, &request->chunk_id());
+    }
+
+    void FreezeChunk(google::protobuf::RpcController* controller, const rpc::ChunkRequest* request,
+                     rpc::FreezeResponse* response, google::protobuf::Closure* done) override {
+        submit(controller, done, *response->mutable_status(), [this, request, response] {
+            response->set_length(store_.freeze_chunk(request->chunk_id()));
+        }, &request->chunk_id());
+    }
+
+private:
+    static constexpr std::size_t max_group_requests = 32;
+
+    using Clock = std::chrono::steady_clock;
+
+    struct Job {
+        std::function<void()> operation;
+        const butil::IOBuf* data = nullptr;
+        rpc::AppendResponse* response = nullptr;
+        google::protobuf::Closure* done = nullptr;
+        std::uint64_t offset = 0;
+        Clock::time_point deadline = Clock::time_point::max();
+        rpc::Code rejection = rpc::OK;
+    };
+
+    struct WriteQueue;
+    struct Ready {
+        std::function<void()> read;
+        const std::string* chunk_id = nullptr;
+        WriteQueue* writes = nullptr;
+        Clock::time_point deadline = Clock::time_point::max();
+    };
+
+    struct WriteQueue {
+        std::list<Job> pending;
+        std::optional<std::list<Ready>::iterator> parked;
+    };
+
+    static bool accept_protocol(brpc::Controller& call) {
+        // bRPC recognizes HTTP even when enabled_protocols lists only baidu_std.
+        if (call.request_protocol() == brpc::PROTOCOL_BAIDU_STD) {
+            return true;
+        }
+        call.SetFailed("ChunkService requires baidu_std");
+        return false;
+    }
+
+    template<class Operation>
+    void submit(google::protobuf::RpcController* controller, google::protobuf::Closure* done,
+                rpc::Status& status, Operation operation, const std::string* id = nullptr,
+                TrafficLane lane = TrafficLane::Online, std::uint64_t bytes = 0) {
+        brpc::ClosureGuard guard(done);
+        if (!accept_protocol(*static_cast<brpc::Controller*>(controller))) {
+            return;
+        }
+        done = reserve(guard, done, status, lane);
+        if (!done) return;
+        try {
+            admit(guard, status, id, Job{[done, &status, operation = std::move(operation)] {
+                complete(done, status, operation);
+            }}, done, lane, bytes);
+        } catch (const std::bad_alloc&) {
+            fail(status, rpc::WRITE_UNAVAILABLE, "could not allocate storage operation");
+        }
+    }
+
+    google::protobuf::Closure* reserve(brpc::ClosureGuard& guard, google::protobuf::Closure* done,
+                                       rpc::Status& status, TrafficLane lane) {
+        auto& counter = in_flight_[chunkstore::lane_index(lane)];
+        const auto limit = lane == TrafficLane::Online ? online_limit_ : 4u;
+        if (counter.fetch_add(1) >= limit) {
+            --counter;
+            fail(status, rpc::WRITE_UNAVAILABLE, "traffic class concurrency limit reached");
+            return nullptr;
+        }
+        auto* wrapper = new (std::nothrow) CountedDone(counter, done);
+        if (!wrapper) {
+            --counter;
+            fail(status, rpc::WRITE_UNAVAILABLE, "could not allocate RPC completion");
+            return nullptr;
+        }
+        guard.release();
+        guard.reset(wrapper);
+        return wrapper;
+    }
+
+    void admit(brpc::ClosureGuard& guard, rpc::Status& status, const std::string* id, Job job,
+               google::protobuf::Closure* done, TrafficLane lane, std::uint64_t bytes) {
+        const auto deadline = job.deadline;
+        try {
+            store_.traffic().enqueue(lane, bytes, [this, id, &status, done, deadline, job = std::move(job)](bool ok) mutable {
+                brpc::ClosureGuard admitted(done);
+                if (ok) enqueue(admitted, status, id, std::move(job));
+                else if (deadline <= Clock::now()) fail(status, rpc::GAP_TIMEOUT, "append expired in traffic queue");
+                else fail(status, rpc::WRITE_UNAVAILABLE, "traffic scheduler stopped");
+            }, {}, deadline);
+            guard.release();
+        } catch (const std::bad_alloc&) {
+            fail(status, rpc::WRITE_UNAVAILABLE, "could not queue traffic");
+        }
+    }
+
+    void enqueue(brpc::ClosureGuard& guard, rpc::Status& status, const std::string* id, Job job) {
+        try {
+            std::lock_guard lock(queue_mutex_);
+            if (id == nullptr) {
+                ready_.push_back(Ready{std::move(job.operation)});
+            } else {
+                auto [entry, inserted] = writes_.try_emplace(*id);
+                try {
+                    auto& queue = entry->second;
+                    const auto previous_size = queue.pending.size();
+                    queue.pending.push_back(std::move(job));
+                    if (inserted) {
+                        ready_.push_back(Ready{{}, &entry->first, &queue});
+                    } else if (queue.parked) {
+                        wake(*queue.parked, previous_size);
+                    }
+                } catch (...) {
+                    if (inserted) {
+                        writes_.erase(entry);
+                    }
+                    throw;
+                }
+            }
+            guard.release();
+        } catch (const std::exception&) {
+            fail(status, rpc::WRITE_UNAVAILABLE, "could not queue storage operation");
+            return;
+        }
+        available_.notify_one();
+    }
+
+    void wake(std::list<Ready>::iterator task, std::size_t waiting) {
+        waiting_count_ -= waiting;
+        task->writes->parked.reset();
+        ready_.splice(ready_.end(), parked_, task);
+    }
+
+    bool wait_for_work(std::unique_lock<std::mutex>& lock, std::stop_token stop) {
+        while (!stop.stop_requested()) {
+            if (!parked_.empty() && parked_.front().deadline <= Clock::now()) {
+                wake(parked_.begin(), parked_.front().writes->pending.size());
+            }
+            if (!ready_.empty()) {
+                return true;
+            }
+            const auto deadline = parked_.empty() ? Clock::time_point::max() : parked_.front().deadline;
+            available_.wait_until(lock, stop, deadline, [&] {
+                return !ready_.empty() || (!parked_.empty() && parked_.front().deadline < deadline);
+            });
+        }
+        return false;
+    }
+
+    static void reject(std::list<Job>& rejected, std::list<Job>& pending,
+                       std::list<Job>::iterator job, rpc::Code code) {
+        job->rejection = code;
+        rejected.splice(rejected.end(), pending, job);
+    }
+
+    std::size_t select(std::list<Job>& pending, std::span<Job> group,
+                       chunkstore::AppendWindow window, std::list<Job>& rejected) {
+        const auto now = Clock::now();
+        std::size_t count = 0;
+        std::size_t bytes = 0;
+        while (count < group.size()) {
+            auto next = pending.end();
+            auto control = pending.end();
+            for (auto it = pending.begin(); it != pending.end();) {
+                auto job = it++;
+                if (job->data == nullptr) {
+                    control = job;
+                    break;
+                }
+
+                const auto size = job->data->size();
+                if (job->deadline <= now) {
+                    reject(rejected, pending, job, rpc::GAP_TIMEOUT);
+                } else if (job->offset < window.offset) {
+                    reject(rejected, pending, job, rpc::OFFSET_CONFLICT);
+                } else if (job->offset > window.capacity || size > window.capacity - job->offset) {
+                    reject(rejected, pending, job, rpc::CHUNK_FULL);
+                } else if (job->offset == window.offset) {
+                    next = job;
+                    break;
+                }
+            }
+            if (next == pending.end()) {
+                if (count == 0 && control != pending.end()) {
+                    group[count++] = std::move(*control);
+                    pending.erase(control);
+                }
+                break;
+            }
+            const auto size = next->data->size();
+            if (size > chunkstore::max_rpc_payload - bytes) {
+                break;
+            }
+            bytes += size;
+            window.offset += size;
+            group[count++] = std::move(*next);
+            pending.erase(next);
+        }
+        return count;
+    }
+
+    void park(std::list<Ready>& running, std::list<Job>& rejected) {
+        auto& task = running.front();
+        auto& pending = task.writes->pending;
+        auto deadline = Clock::time_point::max();
+        for (auto it = pending.begin(); it != pending.end();) {
+            auto job = it++;
+            if (job->deadline == Clock::time_point::max()) {
+                reject(rejected, pending, job, rpc::GAP_TIMEOUT);
+            } else if (waiting_count_ >= waiting_limit_) {
+                reject(rejected, pending, job, rpc::WRITE_UNAVAILABLE);
+            } else {
+                ++waiting_count_;
+                deadline = std::min(deadline, job->deadline);
+            }
+        }
+        if (pending.empty()) {
+            writes_.erase(*task.chunk_id);
+            running.clear();
+            return;
+        }
+
+        task.deadline = deadline;
+        task.writes->parked = running.begin();
+        const auto position = std::find_if(parked_.begin(), parked_.end(),
+            [deadline](const Ready& item) { return item.deadline > deadline; });
+        parked_.splice(position, running);
+        if (parked_.front().deadline == deadline) {
+            available_.notify_all();
+        }
+    }
+
+    static void finish_rejected(const std::list<Job>& rejected, std::exception_ptr failure) {
+        for (const auto& job : rejected) {
+            auto& status = *job.response->mutable_status();
+            complete(job.done, status, [&] {
+                if (job.rejection == rpc::OK) {
+                    std::rethrow_exception(failure);
+                } else if (job.rejection == rpc::GAP_TIMEOUT) {
+                    fail(status, job.rejection, "append expired before its offset became writable");
+                } else if (job.rejection == rpc::OFFSET_CONFLICT) {
+                    fail(status, job.rejection, "append offset overlaps existing bytes");
+                } else if (job.rejection == rpc::CHUNK_FULL) {
+                    fail(status, job.rejection, "append exceeds chunk capacity");
+                } else {
+                    fail(status, job.rejection, "out-of-order append buffer is full");
+                }
+            });
+        }
+    }
+
+    void work(std::stop_token stop) {
+        // The ready node stays alive while a worker owns the Chunk.
+        std::list<Ready> running;
+        std::array<Job, max_group_requests> group;
+        for (;;) {
+            std::unique_lock lock(queue_mutex_);
+            if (!wait_for_work(lock, stop)) {
+                return;
+            }
+            running.splice(running.end(), ready_, ready_.begin());
+            auto& task = running.front();
+            if (task.writes == nullptr) {
+                lock.unlock();
+                task.read();
+                running.clear();
+                continue;
+            }
+
+            auto& pending = task.writes->pending;
+            std::size_t count = 0;
+            std::list<Job> rejected;
+            std::exception_ptr failure;
+            if (pending.front().data == nullptr) {
+                group[count++] = std::move(pending.front());
+                pending.pop_front();
+            } else {
+                chunkstore::AppendWindow window{};
+                lock.unlock();
+                try {
+                    window = store_.append_window(*task.chunk_id);
+                } catch (...) {
+                    failure = std::current_exception();
+                }
+                lock.lock();
+                if (failure) {
+                    auto end = std::find_if(pending.begin(), pending.end(),
+                        [](const Job& job) { return job.data == nullptr; });
+                    rejected.splice(rejected.end(), pending, pending.begin(), end);
+                } else {
+                    count = select(pending, group, window, rejected);
+                    if (count == 0) {
+                        park(running, rejected);
+                        lock.unlock();
+                        finish_rejected(rejected, failure);
+                        continue;
+                    }
+                }
+            }
+
+            lock.unlock();
+            finish_rejected(rejected, failure);
+            if (count != 0) {
+                if (group.front().data == nullptr) {
+                    group.front().operation();
+                } else {
+                    append_group(*task.chunk_id, std::span(group).first(count));
+                }
+                for (auto& job : std::span(group).first(count)) {
+                    job = {};
+                }
+            }
+            lock.lock();
+            if (pending.empty()) {
+                writes_.erase(*task.chunk_id);
+                running.clear();
+            } else {
+                ready_.splice(ready_.end(), running);
+                lock.unlock();
+                available_.notify_one();
+            }
+        }
+    }
+
+    void append_group(std::string_view id, std::span<Job> group) {
+        std::array<chunkstore::AppendGroupItem, max_group_requests> requests;
+        std::exception_ptr failure;
+        try {
+            std::size_t block_count = 0;
+            for (const auto& job : group) {
+                block_count += job.data->backing_block_num();
+            }
+            std::array<std::string_view, max_group_requests> small_buffers;
+            std::vector<std::string_view> large_buffers;
+            std::span<std::string_view> buffers(small_buffers);
+            if (block_count > buffers.size()) {
+                large_buffers.resize(block_count);
+                buffers = large_buffers;
+            }
+            for (std::size_t i = 0; i < group.size(); ++i) {
+                const auto& data = *group[i].data;
+                const auto count = data.backing_block_num();
+                requests[i].buffers = buffers.first(count);
+                for (std::size_t block_index = 0; block_index < count; ++block_index) {
+                    const auto block = data.backing_block(block_index);
+                    buffers[block_index] = std::string_view(block.data(), block.size());
+                }
+                buffers = buffers.subspan(count);
+            }
+            store_.append_group(id, std::span(requests).first(group.size()));
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        for (std::size_t i = 0; i < group.size(); ++i) {
+            const auto& job = group[i];
+            auto& response = *job.response;
+            complete(job.done, *response.mutable_status(), [&] {
+                if (failure) {
+                    std::rethrow_exception(failure);
+                }
+                if (const auto& result = requests[i].result) {
+                    response.set_offset(result->offset);
+                    response.set_length(result->length);
+                } else {
+                    fail(*response.mutable_status(), rpc::CHUNK_FULL, "append exceeds chunk capacity");
+                }
+            });
+        }
+    }
+
+    chunkstore::ChunkStore& store_;
+    chunkstore::RepairReceiver repairs_;
+    std::mutex sender_mutex_;
+    std::condition_variable_any sender_available_;
+    std::array<std::deque<std::function<void()>>, 3> sends_;
+    std::array<std::jthread, 3> senders_;
+    std::array<std::atomic<unsigned>, 5> in_flight_{};
+    const unsigned online_limit_;
+    std::mutex queue_mutex_;
+    std::condition_variable_any available_;
+    std::list<Ready> ready_;
+    std::list<Ready> parked_;
+    std::unordered_map<std::string, WriteQueue> writes_;
+    const std::size_t waiting_limit_;
+    std::size_t waiting_count_ = 0;
+    std::vector<std::jthread> workers_;
+};
+}
+
+int main(int argc, char** argv) {
+    if (argc < 2 || argc > 5) {
+        std::cerr << "usage: chunk_server DATA_DIR [ADDRESS:PORT [MAX_CONCURRENCY [RATE_MIB_S]]]\n";
+        return EXIT_FAILURE;
+    }
+    const char* endpoint = argc > 2 ? argv[2] : "127.0.0.1:8080";
+    int concurrency = 64;
+    if (argc > 3) {
+        const std::string_view value(argv[3]);
+        const auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), concurrency);
+        if (ec != std::errc{} || end != value.data() + value.size() || concurrency < 1) {
+            std::cerr << "invalid max concurrency\n";
+            return EXIT_FAILURE;
+        }
+    }
+    std::uint64_t rate = chunkstore::TrafficLimiter::default_rate;
+    if (argc == 5) {
+        std::uint64_t mib = 0;
+        const std::string_view value(argv[4]);
+        const auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), mib);
+        if (ec != std::errc{} || end != value.end() || !mib || mib > (UINT64_MAX >> 20)) {
+            std::cerr << "invalid traffic rate in MiB/s\n";
+            return EXIT_FAILURE;
+        }
+        rate = mib << 20;
+    }
+    try {
+        chunkstore::ChunkStore store(argv[1], rate);
+        const auto workers = std::min(static_cast<unsigned>(concurrency),
+            std::clamp(std::thread::hardware_concurrency(), 4u, 16u));
+        Service service(store, workers, static_cast<unsigned>(concurrency));
+        brpc::FLAGS_max_body_size = chunkstore::max_rpc_payload + 64 * 1024;
+        brpc::Server server;
+        if (server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
+            return EXIT_FAILURE;
+        }
+        brpc::ServerOptions options;
+        options.has_builtin_services = false;
+        options.enabled_protocols = "baidu_std";
+        // Admission caps are separate for online RPCs, repair commands and inbound blocks.
+        options.max_concurrency = 0;
+        if (server.Start(endpoint, &options) != 0) {
+            return EXIT_FAILURE;
+        }
+        server.RunUntilAskedToQuit();
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << '\n';
+        return EXIT_FAILURE;
+    }
+}

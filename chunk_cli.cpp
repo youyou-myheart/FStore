@@ -1,0 +1,111 @@
+#include "chunk_client.hpp"
+#include "chunk_rpc_limits.hpp"
+
+#include <charconv>
+#include <cstdlib>
+#include <fstream>
+#include <iostream>
+
+namespace {
+std::uint64_t number(std::string_view text) {
+    std::uint64_t value;
+    const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (ec != std::errc{} || end != text.data() + text.size()) {
+        throw std::invalid_argument("expected an unsigned integer");
+    }
+    return value;
+}
+}
+
+int main(int argc, char** argv) {
+    const std::string_view command = argc > 2 ? argv[2] : "";
+    const bool valid = (command == "stats" && argc == 3) ||
+                       ((command == "create" || command == "restore") && argc == 5) ||
+                       (command == "repair" && (argc == 5 || argc == 6)) ||
+                       ((command == "freeze" || command == "delete") && argc == 4) ||
+                       (command == "append" && argc == 7) || (command == "read" && argc == 6);
+    if (!valid) {
+        std::cerr << "usage: chunk_cli ENDPOINT create ID CAPACITY_BYTES\n"
+                     "       chunk_cli ENDPOINT append ID OFFSET WAIT_MS FILE|-\n"
+                     "       chunk_cli ENDPOINT read ID OFFSET LENGTH\n"
+                     "       chunk_cli SOURCE repair ID DESTINATION [high|normal|low]\n"
+                     "       chunk_cli ENDPOINT delete ID\n"
+                     "       chunk_cli ENDPOINT restore ID DELETED_AT_NS\n"
+                     "       chunk_cli ENDPOINT stats\n"
+                     "       chunk_cli ENDPOINT freeze ID\n";
+        return EXIT_FAILURE;
+    }
+    try {
+        chunkstore::ChunkClient client(argv[1]);
+        if (command == "stats") {
+            std::cout << client.traffic_stats().DebugString();
+            return std::cout ? EXIT_SUCCESS : EXIT_FAILURE;
+        }
+        const auto* id = argv[3];
+        if (command == "delete") {
+            std::cout << client.delete_chunk(id) << '\n';
+        } else if (command == "restore") {
+            std::cout << (client.restore_chunk(id, number(argv[4])) == chunkstore::State::Open
+                              ? "open" : "frozen") << '\n';
+        } else if (command == "repair") {
+            chunkstore::rpc::v1::CopyPriority priority = chunkstore::rpc::v1::NORMAL;
+            const std::string_view label = argc == 6 ? argv[5] : "normal";
+            if (label == "high") priority = chunkstore::rpc::v1::HIGH;
+            else if (label == "low") priority = chunkstore::rpc::v1::LOW;
+            else if (label != "normal") throw std::invalid_argument("invalid replication priority");
+            std::cout << client.repair_chunk(id, argv[4], priority) << '\n';
+        } else if (command == "create") {
+            std::cout << (client.create_chunk(id, number(argv[4])) == chunkstore::State::Open
+                              ? "open" : "frozen") << '\n';
+        } else if (command == "append") {
+            const auto expected_offset = number(argv[4]);
+            const auto wait = number(argv[5]);
+            if (wait > chunkstore::max_gap_wait_ms) {
+                throw std::invalid_argument("WAIT_MS must be in 0..60000");
+            }
+            std::ifstream file;
+            std::istream* input = &std::cin;
+            if (std::string_view(argv[6]) != "-") {
+                file.open(argv[6], std::ios::binary);
+                if (!file) {
+                    throw std::runtime_error("could not open append input");
+                }
+                input = &file;
+            }
+            std::string data(chunkstore::max_rpc_payload + 1, '\0');
+            input->read(data.data(), data.size());
+            if (input->bad() || (input->fail() && !input->eof())) {
+                throw std::runtime_error("could not read append input");
+            }
+            data.resize(input->gcount());
+            const auto [offset, length] = client.append(
+                id, expected_offset, data, static_cast<std::uint32_t>(wait));
+            std::cout << offset << ' ' << length << '\n';
+        } else if (command == "read") {
+            const auto length = number(argv[5]);
+            if (length > chunkstore::max_rpc_payload) {
+                throw std::length_error("RPC payload exceeds 8 MiB");
+            }
+            const auto data = client.read_chunk(id, number(argv[4]), static_cast<std::size_t>(length));
+            for (std::size_t i = 0; i < data.backing_block_num(); ++i) {
+                const auto block = data.backing_block(i);
+                std::cout.write(block.data(), block.size());
+            }
+        } else {
+            std::cout << client.freeze_chunk(id) << '\n';
+        }
+        std::cout.flush();
+        if (!std::cout) {
+            throw std::runtime_error("could not write command output");
+        }
+    } catch (const chunkstore::RemoteChunkError& e) {
+        std::cerr << "chunk error (" << e.code() << "): " << e.what() << '\n';
+        return EXIT_FAILURE;
+    } catch (const chunkstore::RpcError& e) {
+        std::cerr << "RPC error (" << e.code() << "): " << e.what() << '\n';
+        return EXIT_FAILURE;
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << '\n';
+        return EXIT_FAILURE;
+    }
+}
