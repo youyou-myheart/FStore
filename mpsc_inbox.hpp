@@ -22,8 +22,12 @@ public:
         if (!head) notify();
     }
 
+    bool has_pending() const noexcept {
+        return head_.load(std::memory_order_acquire) != nullptr;
+    }
+
     Node* take() noexcept {
-        if (!head_.load(std::memory_order_acquire)) return nullptr;
+        if (!has_pending()) return nullptr;
         auto* batch = head_.exchange(nullptr, std::memory_order_acquire);
         Node* first = nullptr;
         while (batch) {

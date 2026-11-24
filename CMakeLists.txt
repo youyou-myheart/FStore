@@ -41,6 +41,8 @@ if(BUILD_TESTING)
     if(Python3_Interpreter_FOUND)
         add_test(NAME replicated_client COMMAND "${Python3_EXECUTABLE}" -B
                  "${CMAKE_CURRENT_SOURCE_DIR}/tests/replicated_client.py" "$<TARGET_FILE_DIR:chunk_cli>")
+        add_test(NAME worker_polling COMMAND "${Python3_EXECUTABLE}" -B
+                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/polling.py" "$<TARGET_FILE_DIR:chunk_cli>")
     endif()
 endif()
 

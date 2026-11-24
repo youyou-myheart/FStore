@@ -14,8 +14,9 @@ BLOCK = 8 * 1024 * 1024
 
 
 class Node:
-    def __init__(self, directory):
+    def __init__(self, directory, *server_args):
         self.root = directory
+        self.server_args = server_args
         self.root.mkdir()
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
@@ -24,7 +25,7 @@ class Node:
         self.start()
 
     def start(self):
-        self.process = subprocess.Popen([BUILD / "chunk_server", self.root, self.endpoint])
+        self.process = subprocess.Popen([BUILD / "chunk_server", self.root, self.endpoint, *self.server_args])
         for _ in range(200):
             try:
                 with socket.create_connection(("127.0.0.1", self.port), timeout=.1):

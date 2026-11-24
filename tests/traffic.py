@@ -1,4 +1,4 @@
-"""Run real online, trash and replication traffic via bRPC: python3 tests/traffic.py BUILD_DIR."""
+"""Run real online, trash and replication traffic via bRPC: python3 tests/traffic.py BUILD_DIR [SERVER_OPTIONS...]."""
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from pathlib import Path
@@ -21,7 +21,7 @@ def start(root, rate, stack):
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
     endpoint = f"127.0.0.1:{port}"
-    server = subprocess.Popen([BUILD / "chunk_server", root, endpoint, "32", str(rate)])
+    server = subprocess.Popen([BUILD / "chunk_server", root, endpoint, "32", str(rate), *sys.argv[2:]])
     def stop():
         server.send_signal(signal.SIGINT)
         server.wait(timeout=20)

@@ -8,6 +8,7 @@
 #include <brpc/controller.h>
 #include <brpc/server.h>
 #include <brpc/protocol.h>
+#include <bthread/processor.h>
 
 #include <algorithm>
 #include <array>
@@ -21,6 +22,8 @@
 #include <iostream>
 #include <list>
 #include <mutex>
+#include <optional>
+#include <span>
 #include <system_error>
 #include <thread>
 #include <unordered_map>
@@ -29,6 +32,48 @@
 namespace {
 namespace rpc = chunkstore::rpc::v1;
 using chunkstore::TrafficLane;
+using PollTime = std::chrono::microseconds;
+
+struct WorkerPolling {
+    PollTime budget{}; // zero sleeps immediately, max polls continuously
+    unsigned workers = 0;
+};
+
+unsigned parse_unsigned(std::string_view text, std::string_view option) {
+    unsigned value;
+    auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (ec != std::errc{} || end != text.data() + text.size())
+        throw std::invalid_argument("expected an unsigned integer for " + std::string(option));
+    return value;
+}
+
+WorkerPolling parse_polling(std::span<char*> args, unsigned worker_count) {
+    std::optional<PollTime> budget;
+    std::optional<unsigned> count;
+    for (std::string_view arg : args) {
+        constexpr std::string_view mode_flag = "--worker-poll=";
+        constexpr std::string_view count_flag = "--poll-workers=";
+        if (arg.starts_with(mode_flag) && !budget) {
+            const auto mode = arg.substr(mode_flag.size());
+            if (mode == "sleep") budget = PollTime::zero();
+            else if (mode == "busy") budget = PollTime::max();
+            else if (mode.ends_with("us"))
+                budget = PollTime(parse_unsigned(mode.substr(0, mode.size() - 2), mode_flag));
+            else throw std::invalid_argument("--worker-poll expects sleep, busy or a duration such as 20us");
+        } else if (arg.starts_with(count_flag) && !count) {
+            count = parse_unsigned(arg.substr(count_flag.size()), count_flag);
+            if (*count == 0 || *count > worker_count)
+                throw std::invalid_argument("--poll-workers must be between 1 and " + std::to_string(worker_count));
+        } else {
+            throw std::invalid_argument("unknown or repeated server option: " + std::string(arg));
+        }
+    }
+    if (budget.value_or(PollTime::zero()) == PollTime::zero()) {
+        if (count) throw std::invalid_argument("--poll-workers requires a positive polling budget or busy mode");
+        return {};
+    }
+    return {*budget, count.value_or(1)};
+}
 
 class CountedDone final : public google::protobuf::Closure {
 public:
@@ -98,9 +143,9 @@ void complete(google::protobuf::Closure* done, rpc::Status& status, Operation op
 
 class Service final : public rpc::ChunkService {
 public:
-    Service(chunkstore::ChunkStore& store, unsigned workers, unsigned concurrency)
+    Service(chunkstore::ChunkStore& store, unsigned workers, unsigned concurrency, WorkerPolling polling)
         : store_(store), repairs_(store), online_limit_(concurrency), waiting_limit_(concurrency / 2),
-          worker_count_(workers), queues_(std::make_unique<Worker[]>(workers)) {
+          worker_count_(workers), polling_(polling), queues_(std::make_unique<Worker[]>(workers)) {
         for (unsigned i = 0; i < senders_.size(); ++i) {
             senders_[i] = std::jthread([this, i](std::stop_token stop) {
                 auto& queue = sends_[i];
@@ -116,7 +161,9 @@ public:
         }
         workers_.reserve(workers);
         for (unsigned i = 0; i < workers; ++i) {
-            workers_.emplace_back([this, i](std::stop_token stop) { work(queues_[i], stop); });
+            workers_.emplace_back([this, i](std::stop_token stop) {
+                work(queues_[i], stop, i < polling_.workers ? polling_.budget : PollTime::zero());
+            });
         }
     }
 
@@ -368,6 +415,13 @@ private:
     }
 
     unsigned least_loaded(unsigned start) const {
+        // Prefer an idle poller for new work. If it is in I/O or owns a parked
+        // append, keep the whole disk pool available. Live write leases bypass
+        // this selection and continue to use their original worker.
+        for (unsigned n = 0; n < polling_.workers; ++n) {
+            const unsigned i = (start + n) % polling_.workers;
+            if (queues_[i].load.load(std::memory_order_relaxed) == 0) return i;
+        }
         unsigned best = start;
         auto minimum = queues_[best].load.load(std::memory_order_relaxed);
         for (unsigned n = 1; minimum && n < worker_count_; ++n) {
@@ -570,7 +624,26 @@ private:
         }
     }
 
-    void work(Worker& worker, std::stop_token stop) {
+    static void wait_for_work(Worker& worker, std::stop_token stop, PollTime budget) {
+        const auto deadline = worker.parked.empty() ? Clock::time_point::max() : worker.parked.front().deadline;
+        if (budget == PollTime::zero()) {
+            worker.inbox.wait(deadline);
+            return;
+        }
+        auto spin_until = deadline;
+        if (budget != PollTime::max()) spin_until = std::min(deadline, Clock::now() + budget);
+        while (!worker.inbox.has_pending() && !stop.stop_requested()) {
+            if (spin_until != Clock::time_point::max() && Clock::now() >= spin_until) break;
+            cpu_relax();
+        }
+        if (spin_until == deadline) return;
+        // A signal can already be posted for a batch consumed while spinning.
+        // Recheck work after consuming it without restarting the spin budget.
+        while (!worker.inbox.has_pending() && !stop.stop_requested() && Clock::now() < deadline)
+            worker.inbox.wait(deadline);
+    }
+
+    void work(Worker& worker, std::stop_token stop, PollTime budget) {
         // The ready node stays alive while a worker owns the Chunk.
         std::list<Ready> running;
         std::array<Job, max_group_requests> group;
@@ -584,7 +657,7 @@ private:
             if (!worker.parked.empty() && worker.parked.front().deadline <= Clock::now())
                 wake(worker, worker.parked.begin(), worker.parked.front().writes->pending.size());
             if (worker.ready.empty()) {
-                worker.inbox.wait(worker.parked.empty() ? Clock::time_point::max() : worker.parked.front().deadline);
+                wait_for_work(worker, stop, budget);
                 continue;
             }
             running.splice(running.end(), worker.ready, worker.ready.begin());
@@ -700,6 +773,7 @@ private:
     const std::size_t waiting_limit_;
     std::atomic<std::size_t> waiting_count_{0};
     const unsigned worker_count_;
+    const WorkerPolling polling_;
     std::unique_ptr<Worker[]> queues_;
     std::array<std::atomic<std::uint64_t>, 1024> owners_{};
     std::atomic<unsigned> next_read_{0};
@@ -708,13 +782,16 @@ private:
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2 || argc > 5) {
-        std::cerr << "usage: chunk_server DATA_DIR [ADDRESS:PORT [MAX_CONCURRENCY [RATE_MIB_S]]]\n";
+    int options_begin = 2;
+    while (options_begin < argc && !std::string_view(argv[options_begin]).starts_with("--")) ++options_begin;
+    if (argc < 2 || options_begin > 5) {
+        std::cerr << "usage: chunk_server DATA_DIR [ADDRESS:PORT [MAX_CONCURRENCY [RATE_MIB_S]]]"
+                     " [--worker-poll=sleep|<N>us|busy] [--poll-workers=N]\n";
         return EXIT_FAILURE;
     }
-    const char* endpoint = argc > 2 ? argv[2] : "127.0.0.1:8080";
+    const char* endpoint = options_begin > 2 ? argv[2] : "127.0.0.1:8080";
     int concurrency = 64;
-    if (argc > 3) {
+    if (options_begin > 3) {
         const std::string_view value(argv[3]);
         const auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), concurrency);
         if (ec != std::errc{} || end != value.data() + value.size() || concurrency < 1) {
@@ -723,7 +800,7 @@ int main(int argc, char** argv) {
         }
     }
     std::uint64_t rate = chunkstore::TrafficLimiter::default_rate;
-    if (argc == 5) {
+    if (options_begin == 5) {
         std::uint64_t mib = 0;
         const std::string_view value(argv[4]);
         const auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), mib);
@@ -734,12 +811,13 @@ int main(int argc, char** argv) {
         rate = mib << 20;
     }
     try {
-        chunkstore::ChunkStore store(argv[1], rate);
         // A worker can sleep in fdatasync. Give unrelated chunk IDs more lanes
         // than CPU cores, bounded by the configured number of outstanding RPCs.
         const auto workers = std::min(static_cast<unsigned>(concurrency),
             4 * std::clamp(std::thread::hardware_concurrency(), 4u, 16u));
-        Service service(store, workers, static_cast<unsigned>(concurrency));
+        const auto polling = parse_polling(std::span(argv + options_begin, argc - options_begin), workers);
+        chunkstore::ChunkStore store(argv[1], rate);
+        Service service(store, workers, static_cast<unsigned>(concurrency), polling);
         brpc::FLAGS_max_body_size = chunkstore::max_rpc_payload + 64 * 1024;
         brpc::Server server;
         if (server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
