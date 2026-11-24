@@ -163,6 +163,14 @@ void save_capacity(int fd, std::uint64_t capacity) {
     }
 }
 
+// A read pins one inode and a length published after data sync. Retirement
+// invalidates cached weak handles without closing an fd beneath an active pread.
+struct ReadVersion {
+    static constexpr auto retired = UINT64_MAX;
+    File file;
+    std::atomic<std::uint64_t> length{0};
+};
+
 struct Chunk {
     Chunk(const fs::path& root, std::string_view id)
         : directory(root / id.substr(0, 2)),
@@ -181,6 +189,8 @@ struct Chunk {
         }
 
         state = frozen_exists ? State::Frozen : State::Open;
+        auto next = std::make_shared<ReadVersion>();
+        auto& file = next->file;
         file.open(frozen_exists ? frozen_path : open_path, frozen_exists ? O_RDONLY : O_RDWR);
         capacity = load_capacity(file.get());
         const auto size = static_cast<std::uint64_t>(frozen_exists ? frozen_info.st_size : open_info.st_size);
@@ -192,9 +202,18 @@ struct Chunk {
             // Sync the capacity too if a legacy registration was interrupted.
             sync_file(file.get(), false);
         }
-        length.store(size, std::memory_order_relaxed);
-        ready.store(true, std::memory_order_release);
+        publish(std::move(next), size);
         return true;
+    }
+
+    void retire() {
+        if (version) version->length.store(ReadVersion::retired, std::memory_order_release);
+        version.reset();
+    }
+
+    void publish(std::shared_ptr<ReadVersion> next, std::uint64_t length) {
+        next->length.store(length, std::memory_order_release);
+        version = std::move(next);
     }
 
     void check_writable() const {
@@ -205,14 +224,14 @@ struct Chunk {
 
     void check_repair_target() const {
         // A new index entry also starts in Open state, before it owns a file.
-        if (state == State::Open && (ready.load() || write_failed)) {
+        if (state == State::Open && (version || write_failed)) {
             throw RepairConflict("cannot repair an open destination chunk");
         }
     }
 
     void check_appendable() const {
         check_writable();
-        if (!ready.load(std::memory_order_relaxed)) {
+        if (!version) {
             system_failure("chunk not found", ENOENT);
         }
         if (state == State::Frozen) {
@@ -226,14 +245,11 @@ struct Chunk {
     fs::path directory;
     fs::path open_path;
     fs::path frozen_path;
-    File file;
+    std::shared_ptr<ReadVersion> version; // accessed under writer after cold loading
     std::mutex writer;
-    std::shared_mutex file_view;
     State state = State::Open;
     bool write_failed = false;
     std::uint64_t capacity = 0;
-    std::atomic<bool> ready{false};
-    std::atomic<std::uint64_t> length{0};
 
 private:
     static bool inspect(const fs::path& path, struct stat& info) {
@@ -250,11 +266,7 @@ private:
     }
 };
 
-std::size_t checked_read(const Chunk& chunk, std::uint64_t offset, std::size_t size) {
-    if (!chunk.ready.load(std::memory_order_acquire)) {
-        system_failure("chunk not found", ENOENT);
-    }
-    const auto length = chunk.length.load(std::memory_order_acquire);
+std::size_t checked_read(std::uint64_t length, std::uint64_t offset, std::size_t size) {
     if (offset > length || size > length - offset) {
         throw std::out_of_range("read range exceeds published chunk length");
     }
@@ -333,10 +345,11 @@ struct ChunkStore::Impl {
         if (id.size() != 32 || id.find_first_not_of(hex) != std::string_view::npos) {
             throw std::invalid_argument("chunk ID must be 32 lowercase hex digits");
         }
+        auto& index = index_for(id);
         {
-            std::shared_lock lock(index_mutex);
-            const auto found = chunks.find(id);
-            if (found != chunks.end()) {
+            std::shared_lock lock(index.mutex);
+            const auto found = index.chunks.find(id);
+            if (found != index.chunks.end()) {
                 return found->second;
             }
         }
@@ -345,9 +358,9 @@ struct ChunkStore::Impl {
         const auto shard = hex.find(id[0]) * 16 + hex.find(id[1]);
         std::lock_guard loading(load_mutexes[shard]);
         {
-            std::shared_lock lock(index_mutex);
-            const auto found = chunks.find(id);
-            if (found != chunks.end()) {
+            std::shared_lock lock(index.mutex);
+            const auto found = index.chunks.find(id);
+            if (found != index.chunks.end()) {
                 return found->second;
             }
         }
@@ -365,8 +378,8 @@ struct ChunkStore::Impl {
             chunk->state = State::Frozen;
             chunk->write_failed = true;
         }
-        std::unique_lock lock(index_mutex);
-        return chunks.emplace(std::string(id), std::move(chunk)).first->second;
+        std::unique_lock lock(index.mutex);
+        return index.chunks.emplace(std::string(id), std::move(chunk)).first->second;
     }
 
     void ensure_shard(std::string_view id, const fs::path& directory) {
@@ -388,8 +401,40 @@ struct ChunkStore::Impl {
     File root_file;
     std::array<std::once_flag, 256> shards;
     std::array<std::mutex, 256> load_mutexes;
-    std::shared_mutex index_mutex;
-    std::unordered_map<std::string, std::shared_ptr<Chunk>, Hash, std::equal_to<>> chunks;
+    struct Index {
+        std::shared_mutex mutex;
+        std::unordered_map<std::string, std::shared_ptr<Chunk>, Hash, std::equal_to<>> chunks;
+    };
+    std::array<Index, 64> indices;
+    Index& index_for(std::string_view id) { return indices[Hash{}(id) % indices.size()]; }
+
+    struct PinnedRead {
+        std::shared_ptr<ReadVersion> version;
+        std::uint64_t length;
+    };
+
+    PinnedRead pin_read(std::string_view id) {
+        struct CacheEntry {
+            const Impl* owner = nullptr;
+            std::string id;
+            std::weak_ptr<ReadVersion> version;
+        };
+        thread_local std::array<CacheEntry, 8> cache;
+        auto& entry = cache[Hash{}(id) % cache.size()];
+        if (entry.owner == this && entry.id == id) {
+            if (auto version = entry.version.lock()) {
+                auto length = version->length.load(std::memory_order_acquire);
+                if (length != ReadVersion::retired) return {std::move(version), length};
+            }
+        }
+        auto chunk = find(id);
+        std::lock_guard lock(chunk->writer);
+        if (!chunk->version) system_failure("chunk not found", ENOENT);
+        entry.id = id;
+        entry.owner = this;
+        entry.version = chunk->version;
+        return {chunk->version, chunk->version->length.load(std::memory_order_relaxed)};
+    }
     TrafficLimiter traffic;
     std::jthread cleaner;
 };
@@ -405,7 +450,7 @@ int ChunkStore::open_snapshot(std::string_view id, ReplicaInfo& info) {
     auto& chunk = *handle;
     std::lock_guard lock(chunk.writer);
     chunk.check_writable();
-    if (!chunk.ready.load()) {
+    if (!chunk.version) {
         system_failure("chunk not found", ENOENT);
     }
     if (chunk.state != State::Frozen) {
@@ -414,8 +459,8 @@ int ChunkStore::open_snapshot(std::string_view id, ReplicaInfo& info) {
     if (chunk.capacity == 0) {
         throw RepairConflict("register source capacity before repair");
     }
-    info = {chunk.length.load(), chunk.capacity, chunk.state};
-    const int fd = ::fcntl(chunk.file.get(), F_DUPFD_CLOEXEC, 0);
+    info = {chunk.version->length.load(), chunk.capacity, chunk.state};
+    const int fd = ::fcntl(chunk.version->file.get(), F_DUPFD_CLOEXEC, 0);
     if (fd < 0) {
         system_failure("duplicate snapshot file");
     }
@@ -458,6 +503,7 @@ void ChunkStore::install_replica(std::string_view id, int fd, const ReplicaInfo&
     // CreateChunk may have published an OPEN file while blocks were in flight.
     chunk.check_repair_target();
 
+    auto next = std::make_shared<ReadVersion>();
     File replacement(::fcntl(fd, F_DUPFD_CLOEXEC, 0));
     if (replacement.get() < 0) {
         system_failure("duplicate repair file");
@@ -471,20 +517,19 @@ void ChunkStore::install_replica(std::string_view id, int fd, const ReplicaInfo&
     if (::linkat(AT_FDCWD, source.c_str(), AT_FDCWD, staging.c_str(), AT_SYMLINK_FOLLOW) < 0) {
         system_failure("link staged replica");
     }
-    std::unique_lock view(chunk.file_view);
     if (::rename(staging.c_str(), chunk.frozen_path.c_str()) < 0) {
         const int error = errno;
         ::unlink(staging.c_str());
         system_failure("publish replica", error);
     }
-    chunk.file.swap(replacement);
+    next->file.swap(replacement);
+    chunk.retire();
     chunk.capacity = info.capacity;
-    chunk.length.store(info.length);
     chunk.state = State::Frozen;
     chunk.write_failed = true;
     sync_directory(chunk.directory);
     chunk.write_failed = false;
-    chunk.ready.store(true);
+    chunk.publish(std::move(next), info.length);
 }
 
 State ChunkStore::create_chunk(std::string_view id, std::uint64_t capacity) {
@@ -495,19 +540,19 @@ State ChunkStore::create_chunk(std::string_view id, std::uint64_t capacity) {
     auto& chunk = *handle;
     std::lock_guard lock(chunk.writer);
     chunk.check_writable();
-    if (chunk.ready.load(std::memory_order_relaxed)) {
+    if (chunk.version) {
         if (chunk.capacity != 0) {
             if (chunk.capacity != capacity) {
                 throw CapacityMismatch("chunk already has a different capacity");
             }
             return chunk.state;
         }
-        if (capacity < chunk.length.load(std::memory_order_relaxed)) {
+        if (capacity < chunk.version->length.load(std::memory_order_relaxed)) {
             throw CapacityMismatch("capacity is smaller than the existing chunk length");
         }
         chunk.write_failed = true;
-        save_capacity(chunk.file.get(), capacity);
-        sync_file(chunk.file.get(), false);
+        save_capacity(chunk.version->file.get(), capacity);
+        sync_file(chunk.version->file.get(), false);
         chunk.capacity = capacity;
         chunk.write_failed = false;
         return chunk.state;
@@ -519,7 +564,8 @@ State ChunkStore::create_chunk(std::string_view id, std::uint64_t capacity) {
     if (::unlink(staging.c_str()) != 0 && errno != ENOENT) {
         system_failure("remove interrupted chunk creation");
     }
-    File file;
+    auto next = std::make_shared<ReadVersion>();
+    auto& file = next->file;
     file.open(staging, O_CREAT | O_EXCL | O_RDWR);
     try {
         save_capacity(file.get(), capacity);
@@ -531,12 +577,11 @@ State ChunkStore::create_chunk(std::string_view id, std::uint64_t capacity) {
         ::unlink(staging.c_str());
         throw;
     }
-    chunk.file.swap(file);
     chunk.capacity = capacity;
     chunk.write_failed = true;
     sync_directory(chunk.directory);
     chunk.write_failed = false;
-    chunk.ready.store(true, std::memory_order_release);
+    chunk.publish(std::move(next), 0);
     return State::Open;
 }
 
@@ -559,7 +604,7 @@ AppendWindow ChunkStore::append_window(std::string_view id) {
     auto& chunk = *handle;
     std::lock_guard lock(chunk.writer);
     chunk.check_appendable();
-    return {chunk.length.load(std::memory_order_relaxed), chunk.capacity};
+    return {chunk.version->length.load(std::memory_order_relaxed), chunk.capacity};
 }
 
 void ChunkStore::append_group(std::string_view id, std::span<AppendGroupItem> requests) {
@@ -567,7 +612,7 @@ void ChunkStore::append_group(std::string_view id, std::span<AppendGroupItem> re
     auto& chunk = *handle;
     std::lock_guard lock(chunk.writer);
     chunk.check_appendable();
-    const auto offset = chunk.length.load(std::memory_order_relaxed);
+    const auto offset = chunk.version->length.load(std::memory_order_relaxed);
     auto end = offset;
     for (auto& request : requests) {
         auto next = end;
@@ -618,7 +663,7 @@ void ChunkStore::append_group(std::string_view id, std::span<AppendGroupItem> re
 
         std::size_t first = 0;
         while (first < count) {
-            const auto written = ::pwritev(chunk.file.get(), vectors.data() + first,
+            const auto written = ::pwritev(chunk.version->file.get(), vectors.data() + first,
                                           static_cast<int>(count - first),
                                           static_cast<off_t>(position));
             if (written < 0 && errno == EINTR) {
@@ -642,27 +687,23 @@ void ChunkStore::append_group(std::string_view id, std::span<AppendGroupItem> re
             }
         }
     }
-    sync_file(chunk.file.get(), true);
-    chunk.length.store(end, std::memory_order_release);
+    sync_file(chunk.version->file.get(), true);
+    chunk.version->length.store(end, std::memory_order_release);
     chunk.write_failed = false;
 }
 
 void ChunkStore::read_chunk(std::string_view id, std::uint64_t offset,
                             std::span<char> output) {
-    const auto handle = impl_->find(id);
-    auto& chunk = *handle;
-    std::shared_lock view(chunk.file_view);
-    checked_read(chunk, offset, output.size());
-    read_exact(chunk.file.get(), offset, output);
+    auto read = impl_->pin_read(id);
+    checked_read(read.length, offset, output.size());
+    read_exact(read.version->file.get(), offset, output);
 }
 
 std::string ChunkStore::read_chunk(std::string_view id, std::uint64_t offset,
                                    std::size_t length) {
-    const auto handle = impl_->find(id);
-    auto& chunk = *handle;
-    std::shared_lock view(chunk.file_view);
-    std::string output(checked_read(chunk, offset, length), '\0');
-    read_exact(chunk.file.get(), offset, output);
+    auto read = impl_->pin_read(id);
+    std::string output(checked_read(read.length, offset, length), '\0');
+    read_exact(read.version->file.get(), offset, output);
     return output;
 }
 
@@ -671,7 +712,7 @@ std::uint64_t ChunkStore::delete_chunk(std::string_view id) {
     auto& chunk = *handle;
     std::lock_guard lock(chunk.writer);
     chunk.check_writable();
-    if (!chunk.ready.load()) {
+    if (!chunk.version) {
         system_failure("chunk not found", ENOENT);
     }
     const auto trash = chunk.directory / ".trash";
@@ -682,7 +723,6 @@ std::uint64_t ChunkStore::delete_chunk(std::string_view id) {
     const auto& source = chunk.state == State::Frozen ? chunk.frozen_path : chunk.open_path;
     const auto suffix = source.extension().native();
     const auto other_suffix = chunk.state == State::Frozen ? ".open" : ".frozen";
-    std::unique_lock view(chunk.file_view);
     auto timestamp = unix_nanoseconds();
     for (;;) {
         const auto base = std::string(id) + "." + std::to_string(timestamp);
@@ -699,10 +739,7 @@ std::uint64_t ChunkStore::delete_chunk(std::string_view id) {
         }
         ++timestamp;
     }
-    File retired;
-    chunk.file.swap(retired);
-    chunk.ready.store(false);
-    chunk.length.store(0);
+    chunk.retire();
     chunk.capacity = 0;
     chunk.state = State::Open;
     chunk.write_failed = true;
@@ -710,9 +747,10 @@ std::uint64_t ChunkStore::delete_chunk(std::string_view id) {
     sync_directory(chunk.directory);
     chunk.write_failed = false;
 
-    std::unique_lock index(impl_->index_mutex);
+    auto& index = impl_->index_for(id);
+    std::unique_lock index_lock(index.mutex);
     if (handle.use_count() == 2) {
-        impl_->chunks.erase(std::string(id));
+        index.chunks.erase(std::string(id));
     }
     return timestamp;
 }
@@ -739,7 +777,8 @@ State ChunkStore::restore_chunk(std::string_view id, std::uint64_t timestamp) {
             system_failure("recycled chunk not found", ENOENT);
         }
     }
-    File file;
+    auto next = std::make_shared<ReadVersion>();
+    auto& file = next->file;
     file.open(source, state == State::Open ? O_RDWR : O_RDONLY);
     const auto capacity = load_capacity(file.get());
     struct stat info{};
@@ -754,10 +793,9 @@ State ChunkStore::restore_chunk(std::string_view id, std::uint64_t timestamp) {
     auto& chunk = *handle;
     std::lock_guard lock(chunk.writer);
     chunk.check_writable();
-    if (chunk.ready.load()) {
+    if (chunk.version) {
         throw RestoreConflict("chunk ID is already active");
     }
-    std::unique_lock view(chunk.file_view);
     if (expired(timestamp, unix_nanoseconds())) {
         system_failure("recycled chunk has expired", ENOENT);
     }
@@ -765,15 +803,13 @@ State ChunkStore::restore_chunk(std::string_view id, std::uint64_t timestamp) {
     if (::renameat2(AT_FDCWD, source.c_str(), AT_FDCWD, target.c_str(), RENAME_NOREPLACE) < 0) {
         system_failure("restore chunk from trash");
     }
-    chunk.file.swap(file);
     chunk.capacity = capacity;
     chunk.state = state;
-    chunk.length.store(length);
     chunk.write_failed = true;
     sync_directory(shard);
     sync_directory(trash);
     chunk.write_failed = false;
-    chunk.ready.store(true, std::memory_order_release);
+    chunk.publish(std::move(next), length);
     return state;
 }
 
@@ -786,10 +822,10 @@ std::uint64_t ChunkStore::freeze_chunk(std::string_view id, std::optional<std::u
     auto& chunk = *handle;
     std::lock_guard lock(chunk.writer);
     chunk.check_writable();
-    if (!chunk.ready.load(std::memory_order_relaxed)) {
+    if (!chunk.version) {
         system_failure("chunk not found", ENOENT);
     }
-    const auto length = chunk.length.load(std::memory_order_relaxed);
+    const auto length = chunk.version->length.load(std::memory_order_relaxed);
     if (expected_length && length != *expected_length) {
         throw LengthMismatch("expected length " + std::to_string(*expected_length) +
                              ", stored length " + std::to_string(length));

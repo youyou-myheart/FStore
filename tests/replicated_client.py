@@ -72,6 +72,19 @@ def verify(nodes):
     for node in nodes:
         assert node.cli("read", key, 0, 2) == b"xy"
 
+    # Concurrent admissions for the same ID must keep one owner until every
+    # parked range is complete, even when other workers are idle.
+    key = "d" * 32
+    ordered = bytes(range(12))
+    cli(replicas, "create", key, len(ordered))
+    with ThreadPoolExecutor(max_workers=len(ordered)) as pool:
+        calls = [pool.submit(cli, replicas, "append", key, i, 10000, "-", data=ordered[i:i+1])
+                 for i in reversed(range(len(ordered)))]
+        for call in calls:
+            call.result()
+    for node in nodes:
+        assert node.cli("read", key, 0, len(ordered)) == ordered
+
     key = "c" * 32
     payload = os.urandom(1024 * 1024 + 17)
     cli(replicas, "create", key, len(payload))

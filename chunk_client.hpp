@@ -56,6 +56,7 @@ public:
     std::uint64_t freeze_chunk(std::string_view id, std::uint64_t expected_length) const;
 
 private:
+    friend class ReplicatedChunkClient;
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

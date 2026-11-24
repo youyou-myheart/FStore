@@ -1,10 +1,12 @@
 #include "traffic_limiter.hpp"
 
+#include <barrier>
 #include <cmath>
 #include <future>
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
+#include <vector>
 
 using namespace std::chrono_literals;
 using chunkstore::TrafficLane;
@@ -14,7 +16,40 @@ void check(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+void check_inbox() {
+    struct Item { unsigned producer, sequence; Item* next = nullptr; };
+    constexpr unsigned producers = 8, per_producer = 4096;
+    std::vector<Item> items(producers * per_producer);
+    chunkstore::MpscInbox<Item> inbox;
+    std::barrier start(producers + 1);
+    std::vector<std::jthread> threads;
+    for (unsigned p = 0; p < producers; ++p) {
+        threads.emplace_back([&, p] {
+            start.arrive_and_wait();
+            for (unsigned seq = 0; seq < per_producer; ++seq) {
+                auto& item = items[p * per_producer + seq];
+                item.producer = p;
+                item.sequence = seq;
+                inbox.push(&item);
+            }
+        });
+    }
+    start.arrive_and_wait();
+    std::array<unsigned, producers> seen{};
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    unsigned count = 0;
+    while (count < items.size()) {
+        check(std::chrono::steady_clock::now() < deadline, "inbox lost a wake or request");
+        for (auto* item = inbox.take(); item; item = item->next) {
+            check(item->sequence == seen.at(item->producer)++, "inbox broke producer FIFO");
+            ++count;
+        }
+        if (count < items.size()) inbox.wait(deadline);
+    }
+}
+
 int main() {
+    check_inbox();
     constexpr auto rate = 16 * 1024 * 1024;
     TrafficLimiter limiter(rate);
     std::stop_source cancel;
@@ -62,8 +97,12 @@ int main() {
           "queued deadline blocked behind a large request");
     std::stop_source stop;
     auto pending = std::async(std::launch::async, [&] {
-        return solo.acquire(TrafficLane::Trash, 1ULL << 40, stop.get_token());
+        return solo.acquire(TrafficLane::Online, 1ULL << 40, stop.get_token());
     });
+    const auto cutoff = Clock::now() + 500ms;
+    while (solo.stats().pending[0] < 2 && Clock::now() < cutoff) std::this_thread::yield();
+    const bool queued = solo.stats().pending[0] >= 2;
     stop.request_stop();
+    check(queued, "cancelled request did not land behind the FIFO head");
     check(pending.wait_for(1s) == std::future_status::ready && !pending.get(), "cleanup cancellation stalled");
 }

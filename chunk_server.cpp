@@ -1,4 +1,5 @@
 #include "chunk_store.hpp"
+#include "mpsc_inbox.hpp"
 #include "chunk_repair.hpp"
 #include "chunk_rpc_limits.hpp"
 #include "chunk.pb.h"
@@ -33,13 +34,23 @@ class CountedDone final : public google::protobuf::Closure {
 public:
     CountedDone(std::atomic<unsigned>& count, google::protobuf::Closure* done)
         : count_(count), done_(done) {}
+    static constexpr std::uint64_t one_request = 1ULL << 32;
+    void routed(std::atomic<unsigned>& load, std::atomic<std::uint64_t>* owner) {
+        load_ = &load;
+        owner_ = owner;
+        load_->fetch_add(1, std::memory_order_relaxed);
+    }
     void Run() override {
+        if (load_) load_->fetch_sub(1, std::memory_order_relaxed);
+        if (owner_) owner_->fetch_sub(one_request, std::memory_order_release);
         auto* done = done_;
         --count_;
         delete this;
         done->Run();
     }
 private:
+    std::atomic<unsigned>* load_ = nullptr;
+    std::atomic<std::uint64_t>* owner_ = nullptr;
     std::atomic<unsigned>& count_;
     google::protobuf::Closure* done_;
 };
@@ -88,7 +99,8 @@ void complete(google::protobuf::Closure* done, rpc::Status& status, Operation op
 class Service final : public rpc::ChunkService {
 public:
     Service(chunkstore::ChunkStore& store, unsigned workers, unsigned concurrency)
-        : store_(store), repairs_(store), online_limit_(concurrency), waiting_limit_(concurrency / 2) {
+        : store_(store), repairs_(store), online_limit_(concurrency), waiting_limit_(concurrency / 2),
+          worker_count_(workers), queues_(std::make_unique<Worker[]>(workers)) {
         for (unsigned i = 0; i < senders_.size(); ++i) {
             senders_[i] = std::jthread([this, i](std::stop_token stop) {
                 auto& queue = sends_[i];
@@ -104,7 +116,7 @@ public:
         }
         workers_.reserve(workers);
         for (unsigned i = 0; i < workers; ++i) {
-            workers_.emplace_back([this](std::stop_token stop) { work(stop); });
+            workers_.emplace_back([this, i](std::stop_token stop) { work(queues_[i], stop); });
         }
     }
 
@@ -201,10 +213,10 @@ public:
         const auto timeout = request->wait_timeout_ms();
         const auto deadline = timeout == 0 ? Clock::time_point::max() :
             Clock::now() + std::chrono::milliseconds(timeout);
-        done = reserve(guard, done, status, TrafficLane::Online);
-        if (done) admit(guard, status, &request->chunk_id(),
-                        Job{{}, &data, response, done, request->offset(), deadline},
-                        done, TrafficLane::Online, data.size());
+        auto* counted = reserve(guard, done, status, TrafficLane::Online);
+        if (counted) admit(guard, status, &request->chunk_id(),
+                        Job{{}, &data, response, counted, request->offset(), deadline},
+                        counted, TrafficLane::Online, data.size());
     }
 
     void ReadChunk(google::protobuf::RpcController* controller, const rpc::ReadRequest* request,
@@ -291,6 +303,22 @@ private:
         std::optional<std::list<Ready>::iterator> parked;
     };
 
+    struct Submission {
+        const std::string* id;
+        Job job;
+        rpc::Status* status;
+        google::protobuf::Closure* done;
+        Submission* next = nullptr;
+    };
+
+    struct alignas(64) Worker {
+        std::atomic<unsigned> load{0};
+        chunkstore::MpscInbox<Submission> inbox;
+        std::list<Ready> ready;
+        std::list<Ready> parked;
+        std::unordered_map<std::string, WriteQueue> writes;
+    };
+
     static bool accept_protocol(brpc::Controller& call) {
         // bRPC recognizes HTTP even when enabled_protocols lists only baidu_std.
         if (call.request_protocol() == brpc::PROTOCOL_BAIDU_STD) {
@@ -308,18 +336,18 @@ private:
         if (!accept_protocol(*static_cast<brpc::Controller*>(controller))) {
             return;
         }
-        done = reserve(guard, done, status, lane);
-        if (!done) return;
+        auto* counted = reserve(guard, done, status, lane);
+        if (!counted) return;
         try {
-            admit(guard, status, id, Job{[done, &status, operation = std::move(operation)] {
-                complete(done, status, operation);
-            }}, done, lane, bytes);
+            admit(guard, status, id, Job{[counted, &status, operation = std::move(operation)] {
+                complete(counted, status, operation);
+            }}, counted, lane, bytes);
         } catch (const std::bad_alloc&) {
             fail(status, rpc::WRITE_UNAVAILABLE, "could not allocate storage operation");
         }
     }
 
-    google::protobuf::Closure* reserve(brpc::ClosureGuard& guard, google::protobuf::Closure* done,
+    CountedDone* reserve(brpc::ClosureGuard& guard, google::protobuf::Closure* done,
                                        rpc::Status& status, TrafficLane lane) {
         auto& counter = in_flight_[chunkstore::lane_index(lane)];
         const auto limit = lane == TrafficLane::Online ? online_limit_ : 4u;
@@ -339,14 +367,59 @@ private:
         return wrapper;
     }
 
+    unsigned least_loaded(unsigned start) const {
+        unsigned best = start;
+        auto minimum = queues_[best].load.load(std::memory_order_relaxed);
+        for (unsigned n = 1; minimum && n < worker_count_; ++n) {
+            const unsigned i = (start + n) % worker_count_;
+            const auto load = queues_[i].load.load(std::memory_order_relaxed);
+            if (load < minimum) {
+                best = i;
+                minimum = load;
+            }
+        }
+        return best;
+    }
+
+    unsigned route(const std::string* id, CountedDone& done) {
+        if (!id) {
+            const auto start = next_read_.fetch_add(1, std::memory_order_relaxed) % worker_count_;
+            const auto i = least_loaded(start);
+            done.routed(queues_[i].load, nullptr);
+            return i;
+        }
+        const auto hash = std::hash<std::string_view>{}(*id);
+        auto& owner = owners_[hash % owners_.size()];
+        auto current = owner.load(std::memory_order_relaxed);
+        // Low bits name the worker, high bits count all jobs until completion,
+        // including parked appends. An idle bucket can migrate around blocked I/O.
+        for (;;) {
+            const bool idle = current < CountedDone::one_request;
+            const auto i = idle ? least_loaded(hash % worker_count_) : static_cast<unsigned>(current);
+            const auto next = (idle ? i : current) + CountedDone::one_request;
+            if (owner.compare_exchange_weak(current, next, std::memory_order_acq_rel)) {
+                done.routed(queues_[i].load, &owner);
+                return i;
+            }
+        }
+    }
+
     void admit(brpc::ClosureGuard& guard, rpc::Status& status, const std::string* id, Job job,
-               google::protobuf::Closure* done, TrafficLane lane, std::uint64_t bytes) {
+               CountedDone* done, TrafficLane lane, std::uint64_t bytes) {
         const auto deadline = job.deadline;
         try {
             store_.traffic().enqueue(lane, bytes, [this, id, &status, done, deadline, job = std::move(job)](bool ok) mutable {
                 brpc::ClosureGuard admitted(done);
-                if (ok) enqueue(admitted, status, id, std::move(job));
-                else if (deadline <= Clock::now()) fail(status, rpc::GAP_TIMEOUT, "append expired in traffic queue");
+                if (ok) {
+                    auto* item = new (std::nothrow) Submission{id, std::move(job), &status, done};
+                    if (!item) {
+                        fail(status, rpc::WRITE_UNAVAILABLE, "could not queue storage operation");
+                        return;
+                    }
+                    const auto index = route(id, *done);
+                    admitted.release();
+                    queues_[index].inbox.push(item);
+                } else if (deadline <= Clock::now()) fail(status, rpc::GAP_TIMEOUT, "append expired in traffic queue");
                 else fail(status, rpc::WRITE_UNAVAILABLE, "traffic scheduler stopped");
             }, {}, deadline);
             guard.release();
@@ -355,57 +428,47 @@ private:
         }
     }
 
-    void enqueue(brpc::ClosureGuard& guard, rpc::Status& status, const std::string* id, Job job) {
+    void enqueue(Worker& worker, Submission& item) {
+        brpc::ClosureGuard guard(item.done);
+        const auto* id = item.id;
+        auto& job = item.job;
         try {
-            std::lock_guard lock(queue_mutex_);
             if (id == nullptr) {
-                ready_.push_back(Ready{std::move(job.operation)});
+                if (worker.ready.empty()) {
+                    guard.release();
+                    job.operation();
+                    return;
+                }
+                worker.ready.push_back(Ready{std::move(job.operation)});
             } else {
-                auto [entry, inserted] = writes_.try_emplace(*id);
+                auto [entry, inserted] = worker.writes.try_emplace(*id);
                 try {
                     auto& queue = entry->second;
                     const auto previous_size = queue.pending.size();
                     queue.pending.push_back(std::move(job));
                     if (inserted) {
-                        ready_.push_back(Ready{{}, &entry->first, &queue});
+                        worker.ready.push_back(Ready{{}, &entry->first, &queue});
                     } else if (queue.parked) {
-                        wake(*queue.parked, previous_size);
+                        wake(worker, *queue.parked, previous_size);
                     }
                 } catch (...) {
                     if (inserted) {
-                        writes_.erase(entry);
+                        worker.writes.erase(entry);
                     }
                     throw;
                 }
             }
             guard.release();
         } catch (const std::exception&) {
-            fail(status, rpc::WRITE_UNAVAILABLE, "could not queue storage operation");
+            fail(*item.status, rpc::WRITE_UNAVAILABLE, "could not queue storage operation");
             return;
         }
-        available_.notify_one();
     }
 
-    void wake(std::list<Ready>::iterator task, std::size_t waiting) {
-        waiting_count_ -= waiting;
+    void wake(Worker& worker, std::list<Ready>::iterator task, std::size_t waiting) {
+        waiting_count_.fetch_sub(waiting, std::memory_order_relaxed);
         task->writes->parked.reset();
-        ready_.splice(ready_.end(), parked_, task);
-    }
-
-    bool wait_for_work(std::unique_lock<std::mutex>& lock, std::stop_token stop) {
-        while (!stop.stop_requested()) {
-            if (!parked_.empty() && parked_.front().deadline <= Clock::now()) {
-                wake(parked_.begin(), parked_.front().writes->pending.size());
-            }
-            if (!ready_.empty()) {
-                return true;
-            }
-            const auto deadline = parked_.empty() ? Clock::time_point::max() : parked_.front().deadline;
-            available_.wait_until(lock, stop, deadline, [&] {
-                return !ready_.empty() || (!parked_.empty() && parked_.front().deadline < deadline);
-            });
-        }
-        return false;
+        worker.ready.splice(worker.ready.end(), worker.parked, task);
     }
 
     static void reject(std::list<Job>& rejected, std::list<Job>& pending,
@@ -460,7 +523,7 @@ private:
         return count;
     }
 
-    void park(std::list<Ready>& running, std::list<Job>& rejected) {
+    void park(Worker& worker, std::list<Ready>& running, std::list<Job>& rejected) {
         auto& task = running.front();
         auto& pending = task.writes->pending;
         auto deadline = Clock::time_point::max();
@@ -468,27 +531,24 @@ private:
             auto job = it++;
             if (job->deadline == Clock::time_point::max()) {
                 reject(rejected, pending, job, rpc::GAP_TIMEOUT);
-            } else if (waiting_count_ >= waiting_limit_) {
+            } else if (waiting_count_.fetch_add(1, std::memory_order_relaxed) >= waiting_limit_) {
+                waiting_count_.fetch_sub(1, std::memory_order_relaxed);
                 reject(rejected, pending, job, rpc::WRITE_UNAVAILABLE);
             } else {
-                ++waiting_count_;
                 deadline = std::min(deadline, job->deadline);
             }
         }
         if (pending.empty()) {
-            writes_.erase(*task.chunk_id);
+            worker.writes.erase(*task.chunk_id);
             running.clear();
             return;
         }
 
         task.deadline = deadline;
         task.writes->parked = running.begin();
-        const auto position = std::find_if(parked_.begin(), parked_.end(),
+        const auto position = std::find_if(worker.parked.begin(), worker.parked.end(),
             [deadline](const Ready& item) { return item.deadline > deadline; });
-        parked_.splice(position, running);
-        if (parked_.front().deadline == deadline) {
-            available_.notify_all();
-        }
+        worker.parked.splice(position, running);
     }
 
     static void finish_rejected(const std::list<Job>& rejected, std::exception_ptr failure) {
@@ -510,19 +570,26 @@ private:
         }
     }
 
-    void work(std::stop_token stop) {
+    void work(Worker& worker, std::stop_token stop) {
         // The ready node stays alive while a worker owns the Chunk.
         std::list<Ready> running;
         std::array<Job, max_group_requests> group;
-        for (;;) {
-            std::unique_lock lock(queue_mutex_);
-            if (!wait_for_work(lock, stop)) {
-                return;
+        std::stop_callback wake_on_stop(stop, [&] { worker.inbox.notify(); });
+        while (!stop.stop_requested()) {
+            for (auto* item = worker.inbox.take(); item;) {
+                std::unique_ptr<Submission> current(item);
+                item = item->next;
+                enqueue(worker, *current);
             }
-            running.splice(running.end(), ready_, ready_.begin());
+            if (!worker.parked.empty() && worker.parked.front().deadline <= Clock::now())
+                wake(worker, worker.parked.begin(), worker.parked.front().writes->pending.size());
+            if (worker.ready.empty()) {
+                worker.inbox.wait(worker.parked.empty() ? Clock::time_point::max() : worker.parked.front().deadline);
+                continue;
+            }
+            running.splice(running.end(), worker.ready, worker.ready.begin());
             auto& task = running.front();
             if (task.writes == nullptr) {
-                lock.unlock();
                 task.read();
                 running.clear();
                 continue;
@@ -537,13 +604,11 @@ private:
                 pending.pop_front();
             } else {
                 chunkstore::AppendWindow window{};
-                lock.unlock();
                 try {
                     window = store_.append_window(*task.chunk_id);
                 } catch (...) {
                     failure = std::current_exception();
                 }
-                lock.lock();
                 if (failure) {
                     auto end = std::find_if(pending.begin(), pending.end(),
                         [](const Job& job) { return job.data == nullptr; });
@@ -551,15 +616,13 @@ private:
                 } else {
                     count = select(pending, group, window, rejected);
                     if (count == 0) {
-                        park(running, rejected);
-                        lock.unlock();
+                        park(worker, running, rejected);
                         finish_rejected(rejected, failure);
                         continue;
                     }
                 }
             }
 
-            lock.unlock();
             finish_rejected(rejected, failure);
             if (count != 0) {
                 if (group.front().data == nullptr) {
@@ -571,14 +634,11 @@ private:
                     job = {};
                 }
             }
-            lock.lock();
             if (pending.empty()) {
-                writes_.erase(*task.chunk_id);
+                worker.writes.erase(*task.chunk_id);
                 running.clear();
             } else {
-                ready_.splice(ready_.end(), running);
-                lock.unlock();
-                available_.notify_one();
+                worker.ready.splice(worker.ready.end(), running);
             }
         }
     }
@@ -637,13 +697,12 @@ private:
     std::array<std::jthread, 3> senders_;
     std::array<std::atomic<unsigned>, 5> in_flight_{};
     const unsigned online_limit_;
-    std::mutex queue_mutex_;
-    std::condition_variable_any available_;
-    std::list<Ready> ready_;
-    std::list<Ready> parked_;
-    std::unordered_map<std::string, WriteQueue> writes_;
     const std::size_t waiting_limit_;
-    std::size_t waiting_count_ = 0;
+    std::atomic<std::size_t> waiting_count_{0};
+    const unsigned worker_count_;
+    std::unique_ptr<Worker[]> queues_;
+    std::array<std::atomic<std::uint64_t>, 1024> owners_{};
+    std::atomic<unsigned> next_read_{0};
     std::vector<std::jthread> workers_;
 };
 }
@@ -676,8 +735,10 @@ int main(int argc, char** argv) {
     }
     try {
         chunkstore::ChunkStore store(argv[1], rate);
+        // A worker can sleep in fdatasync. Give unrelated chunk IDs more lanes
+        // than CPU cores, bounded by the configured number of outstanding RPCs.
         const auto workers = std::min(static_cast<unsigned>(concurrency),
-            std::clamp(std::thread::hardware_concurrency(), 4u, 16u));
+            4 * std::clamp(std::thread::hardware_concurrency(), 4u, 16u));
         Service service(store, workers, static_cast<unsigned>(concurrency));
         brpc::FLAGS_max_body_size = chunkstore::max_rpc_payload + 64 * 1024;
         brpc::Server server;

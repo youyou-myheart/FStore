@@ -49,51 +49,59 @@ RepairReceiver::RepairReceiver(ChunkStore& store)
         while (!stop.stop_requested()) {
             auto deadline = std::chrono::steady_clock::time_point::max();
             for (auto& slot : transfers_) {
-                if (slot && slot->deadline <= std::chrono::steady_clock::now()) slot.reset();
-                if (slot) deadline = std::min(deadline, slot->deadline);
+                if (slot && !slot->busy && slot->deadline <= std::chrono::steady_clock::now()) slot.reset();
+                if (slot && !slot->busy) deadline = std::min(deadline, slot->deadline);
             }
             // New sessions may have earlier deadlines. Wake and recalculate.
             changed_.wait_until(lock, stop, deadline, [&] {
                 return std::any_of(transfers_.begin(), transfers_.end(), [&](const auto& slot) {
-                    return slot && slot->deadline < deadline;
+                    return slot && !slot->busy && slot->deadline < deadline;
                 });
             });
         }
     }) {}
 
 void RepairReceiver::discard(std::string_view id) {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
+    changed_.wait(lock, [&] {
+        return std::none_of(transfers_.begin(), transfers_.end(), [&](const auto& slot) {
+            return slot && slot->id == id && slot->busy;
+        });
+    });
     for (auto& slot : transfers_) {
         if (slot && slot->id == id) slot.reset();
     }
-    changed_.notify_one();
+    changed_.notify_all();
 }
 
 std::uint64_t RepairReceiver::receive(const wire::RepairBlock& block, butil::IOBuf data) {
     const auto lane = copy_lane(block.priority());
-    std::lock_guard lock(mutex_);
+    if (!block.abort()) {
+        if (!block.frozen()) {
+            throw RepairConflict("repair blocks must come from a frozen chunk");
+        }
+        if (block.transfer_id().empty() || block.transfer_id().size() > 64 ||
+            block.capacity() == 0 || block.capacity() > std::numeric_limits<std::int64_t>::max() ||
+            block.total_length() > block.capacity() || block.offset() > block.total_length() ||
+            data.size() > max_rpc_payload || data.size() > block.total_length() - block.offset() ||
+            (data.empty() && block.total_length() != 0)) {
+            throw std::invalid_argument("invalid repair block");
+        }
+        if (checksum(data) != block.crc32c()) {
+            throw RepairConflict("repair block checksum mismatch");
+        }
+    }
+    std::unique_lock lock(mutex_);
     auto& active = transfers_[lane_index(lane) - lane_index(TrafficLane::CopyNormal)];
+    changed_.wait(lock, [&] { return !active || !active->busy; });
     const bool matches = active && active->id == block.chunk_id() &&
                          active->token == block.transfer_id();
     if (block.abort()) {
         if (matches) {
             active.reset();
-            changed_.notify_one();
+            changed_.notify_all();
         }
         return 0;
-    }
-    if (!block.frozen()) {
-        throw RepairConflict("repair blocks must come from a frozen chunk");
-    }
-    if (block.transfer_id().empty() || block.transfer_id().size() > 64 ||
-        block.capacity() == 0 || block.capacity() > std::numeric_limits<std::int64_t>::max() ||
-        block.total_length() > block.capacity() || block.offset() > block.total_length() ||
-        data.size() > max_rpc_payload || data.size() > block.total_length() - block.offset() ||
-        (data.empty() && block.total_length() != 0)) {
-        throw std::invalid_argument("invalid repair block");
-    }
-    if (checksum(data) != block.crc32c()) {
-        throw RepairConflict("repair block checksum mismatch");
     }
     if (!active) {
         if (block.offset() != 0) {
@@ -104,14 +112,17 @@ std::uint64_t RepairReceiver::receive(const wire::RepairBlock& block, butil::IOB
                 throw RepairConflict("destination already receiving this chunk");
             }
         }
-        active.emplace(store_, block);
+        active.emplace(block);
     } else if (!matches || active->next != block.offset() ||
                active->info.length != block.total_length() ||
                active->info.capacity != block.capacity()) {
         throw RepairConflict("destination is receiving another transfer or expected a different block");
     }
     auto& transfer = *active;
+    transfer.busy = true;
+    lock.unlock();
     try {
+        if (!transfer.file.is_valid()) transfer.file.reset(store_.open_repair_file(transfer.id));
         while (!data.empty()) {
             const auto count = data.pcut_into_file_descriptor(transfer.file.get(), transfer.next);
             if (count < 0 && errno == EINTR) {
@@ -123,15 +134,20 @@ std::uint64_t RepairReceiver::receive(const wire::RepairBlock& block, butil::IOB
         const auto next = transfer.next;
         if (next == transfer.info.length) {
             store_.install_replica(transfer.id, transfer.file.get(), transfer.info);
+        }
+        lock.lock();
+        if (next == transfer.info.length) {
             active.reset();
         } else {
+            transfer.busy = false;
             transfer.deadline = std::chrono::steady_clock::now() + 60s;
         }
-        changed_.notify_one();
+        changed_.notify_all();
         return next;
     } catch (...) {
+        lock.lock();
         active.reset();
-        changed_.notify_one();
+        changed_.notify_all();
         throw;
     }
 }

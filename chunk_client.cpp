@@ -50,6 +50,35 @@ void check_response(const brpc::Controller& controller, const Response& response
         throw RemoteChunkError(response.status().code(), response.status().message());
     }
 }
+
+wire::AppendRequest append_request(std::string_view id, std::uint64_t offset, std::size_t length,
+                                   std::uint32_t wait_timeout_ms) {
+    wire::AppendRequest request;
+    request.set_chunk_id(std::string(id));
+    request.set_length(length);
+    request.set_offset(offset);
+    request.set_wait_timeout_ms(wait_timeout_ms);
+    return request;
+}
+
+void prepare_append(brpc::Controller& controller, const butil::IOBuf& data, int timeout_ms,
+                    std::uint32_t wait_timeout_ms) {
+    if (timeout_ms >= 0) {
+        const auto total = static_cast<std::int64_t>(timeout_ms) + wait_timeout_ms;
+        controller.set_timeout_ms(static_cast<int>(
+            std::min<std::int64_t>(total, std::numeric_limits<int>::max())));
+    }
+    controller.request_attachment().append(data);
+}
+
+AppendResult append_result(const brpc::Controller& controller, const wire::AppendResponse& response,
+                           std::uint64_t offset, std::size_t length) {
+    check_response(controller, response);
+    if (response.length() != length || response.offset() != offset) {
+        throw RpcError(EPROTO, "append response range mismatch");
+    }
+    return {response.offset(), response.length()};
+}
 }
 
 struct ChunkClient::Impl {
@@ -124,25 +153,12 @@ AppendResult ChunkClient::append(std::string_view id, std::uint64_t offset,
 AppendResult ChunkClient::append(std::string_view id, std::uint64_t offset,
                                  const butil::IOBuf& data, std::uint32_t wait_timeout_ms) const {
     check_append(data.size(), wait_timeout_ms);
-    wire::AppendRequest request;
     wire::AppendResponse response;
     brpc::Controller controller;
-    request.set_chunk_id(std::string(id));
-    request.set_length(data.size());
-    request.set_offset(offset);
-    request.set_wait_timeout_ms(wait_timeout_ms);
-    if (impl_->timeout_ms >= 0) {
-        const auto total = static_cast<std::int64_t>(impl_->timeout_ms) + wait_timeout_ms;
-        controller.set_timeout_ms(static_cast<int>(
-            std::min<std::int64_t>(total, std::numeric_limits<int>::max())));
-    }
-    controller.request_attachment().append(data);
+    auto request = append_request(id, offset, data.size(), wait_timeout_ms);
+    prepare_append(controller, data, impl_->timeout_ms, wait_timeout_ms);
     impl_->stub.Append(&controller, &request, &response, nullptr);
-    check_response(controller, response);
-    if (response.length() != data.size() || response.offset() != offset) {
-        throw RpcError(EPROTO, "append response range mismatch");
-    }
-    return {response.offset(), response.length()};
+    return append_result(controller, response, offset, data.size());
 }
 
 butil::IOBuf ChunkClient::read_chunk(std::string_view id, std::uint64_t offset,
@@ -256,10 +272,11 @@ ReplicatedChunkClient::ReplicatedChunkClient(const std::vector<std::string>& end
 
 template<class Operation>
 auto ReplicatedChunkClient::commit(const Operation& operation) const {
-    using Value = std::invoke_result_t<Operation, const ChunkClient&>;
+    using Value = std::invoke_result_t<Operation, const ChunkClient&, std::size_t>;
     struct Call {
         const ChunkClient* client;
         const Operation* operation;
+        std::size_t index;
         Value value{};
         std::exception_ptr error;
         bthread_t thread{};
@@ -269,7 +286,7 @@ auto ReplicatedChunkClient::commit(const Operation& operation) const {
     auto run = [](void* arg) -> void* {
         auto& call = *static_cast<Call*>(arg);
         try {
-            call.value = (*call.operation)(*call.client);
+            call.value = (*call.operation)(*call.client, call.index);
         } catch (...) {
             call.error = std::current_exception();
         }
@@ -280,6 +297,7 @@ auto ReplicatedChunkClient::commit(const Operation& operation) const {
         auto& call = calls[i];
         call.client = nodes_[i].client.get();
         call.operation = &operation;
+        call.index = i;
         if (i + 1 < calls.size()) {
             call.started = bthread_start_background(&call.thread, nullptr, run, &call) == 0;
         }
@@ -305,7 +323,7 @@ auto ReplicatedChunkClient::commit(const Operation& operation) const {
 }
 
 State ReplicatedChunkClient::create_chunk(std::string_view id, std::uint64_t capacity) const {
-    return commit([&](const ChunkClient& client) { return client.create_chunk(id, capacity); });
+    return commit([&](const ChunkClient& client, std::size_t) { return client.create_chunk(id, capacity); });
 }
 
 AppendResult ReplicatedChunkClient::append(std::string_view id, std::uint64_t offset,
@@ -316,10 +334,50 @@ AppendResult ReplicatedChunkClient::append(std::string_view id, std::uint64_t of
 AppendResult ReplicatedChunkClient::append(std::string_view id, std::uint64_t offset,
                                            const butil::IOBuf& data, std::uint32_t wait_timeout_ms) const {
     check_append(data.size(), wait_timeout_ms);
-    const auto length = commit([&](const ChunkClient& client) -> std::uint64_t {
+    // Prepare every attachment before starting any RPC. The immutable request and
+    // each controller stay live until Join, including when a later launch fails.
+    struct Call {
+        brpc::Controller controller;
+        wire::AppendResponse response;
+        std::exception_ptr error;
+        bool started = false;
+        void join() {
+            if (started) {
+                brpc::Join(controller.call_id());
+                started = false;
+            }
+        }
+        ~Call() { join(); }
+    };
+    auto request = append_request(id, offset, data.size(), wait_timeout_ms);
+    std::vector<Call> calls(nodes_.size());
+    for (std::size_t i = 0; i < nodes_.size(); ++i) {
+        prepare_append(calls[i].controller, data, nodes_[i].client->impl_->timeout_ms, wait_timeout_ms);
+    }
+    for (std::size_t i = 0; i < nodes_.size(); ++i) {
+        auto& call = calls[i];
+        nodes_[i].client->impl_->stub.Append(&call.controller, &request, &call.response, brpc::DoNothing());
+        call.started = true;
+    }
+    bool all_confirmed = true;
+    for (auto& call : calls) {
+        call.join();
+        try {
+            append_result(call.controller, call.response, offset, data.size());
+        } catch (...) {
+            call.error = std::current_exception();
+            all_confirmed = false;
+        }
+    }
+    if (all_confirmed) return {offset, data.size()};
+
+    // Only failed range checks need a second, possibly blocking RPC. Use the
+    // same parallel verifier and per-endpoint error reporting as lifecycle calls.
+    const auto length = commit([&](const ChunkClient& client, std::size_t i) -> std::uint64_t {
+        if (!calls[i].error) return data.size();
         wire::Code conflict;
         try {
-            return client.append(id, offset, data, wait_timeout_ms).length;
+            std::rethrow_exception(calls[i].error);
         } catch (const RemoteChunkError& e) {
             if (e.code() != wire::OFFSET_CONFLICT && e.code() != wire::FROZEN) throw;
             conflict = e.code();
@@ -337,7 +395,7 @@ AppendResult ReplicatedChunkClient::append(std::string_view id, std::uint64_t of
 }
 
 std::uint64_t ReplicatedChunkClient::freeze_chunk(std::string_view id, std::uint64_t expected_length) const {
-    return commit([&](const ChunkClient& client) { return client.freeze_chunk(id, expected_length); });
+    return commit([&](const ChunkClient& client, std::size_t) { return client.freeze_chunk(id, expected_length); });
 }
 
 } // namespace chunkstore

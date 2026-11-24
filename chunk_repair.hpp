@@ -23,15 +23,15 @@ public:
     std::uint64_t receive(const rpc::v1::RepairBlock& block, butil::IOBuf data);
 private:
     struct Transfer {
-        Transfer(ChunkStore& store, const rpc::v1::RepairBlock& block)
+        explicit Transfer(const rpc::v1::RepairBlock& block)
             : id(block.chunk_id()), token(block.transfer_id()),
-              info{block.total_length(), block.capacity(), State::Frozen},
-              file(store.open_repair_file(id)) {}
+              info{block.total_length(), block.capacity(), State::Frozen} {}
 
         std::string id;
         std::string token;
         ReplicaInfo info;
         butil::ScopedFD file;
+        bool busy = false; // pins this slot while its worker performs I/O
         std::uint64_t next = 0;
         std::chrono::steady_clock::time_point deadline;
     };
