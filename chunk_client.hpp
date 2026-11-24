@@ -5,6 +5,7 @@
 
 #include <butil/iobuf.h>
 #include <exception>
+#include <optional>
 #include <vector>
 
 namespace chunkstore {
@@ -56,6 +57,8 @@ public:
     std::uint64_t freeze_chunk(std::string_view id, std::uint64_t expected_length) const;
 
 private:
+    struct ReadResult { butil::IOBuf data; bool frozen = false; };
+    ReadResult read_with_state(std::string_view id, std::uint64_t offset, std::size_t length) const;
     friend class ReplicatedChunkClient;
     struct Impl;
     std::unique_ptr<Impl> impl_;
@@ -67,9 +70,18 @@ struct ReplicaReply {
     std::exception_ptr error; // RpcError, RemoteChunkError or local exception, if any.
 };
 
+struct ReplicaReadResult {
+    std::string endpoint;
+    butil::IOBuf data;
+    // Present on successful reads from servers that report the frozen state.
+    std::optional<bool> frozen;
+    std::exception_ptr error; // Per-replica failure; data is empty and frozen unset.
+};
+
 class ReplicaCommitError : public std::runtime_error {
 public:
-    explicit ReplicaCommitError(std::vector<ReplicaReply> replies);
+    explicit ReplicaCommitError(std::vector<ReplicaReply> replies,
+                                std::string message = "replica commit incomplete");
     const std::vector<ReplicaReply>& replies() const noexcept { return replies_; }
 private:
     std::vector<ReplicaReply> replies_;
@@ -88,6 +100,11 @@ public:
     AppendResult append(std::string_view id, std::uint64_t offset, const butil::IOBuf& data,
                         std::uint32_t wait_timeout_ms) const;
     std::uint64_t freeze_chunk(std::string_view id, std::uint64_t expected_length) const;
+    // One frozen reply or a strict majority of identical successful reads.
+    butil::IOBuf read_chunk(std::string_view id, std::uint64_t offset, std::size_t length) const;
+    // Read every replica concurrently, retaining every result in endpoint order.
+    std::vector<ReplicaReadResult> read_replicas(std::string_view id, std::uint64_t offset,
+                                              std::size_t length) const;
 
 private:
     struct Node {

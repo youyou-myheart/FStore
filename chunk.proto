@@ -65,6 +65,7 @@ message ReadRequest {
 // Read payload is carried in the bRPC response attachment.
 message ReadResponse {
   Status status = 1;
+  optional bool frozen = 2;
 }
 
 message DeleteResponse {

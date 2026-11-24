@@ -169,6 +169,7 @@ struct ReadVersion {
     static constexpr auto retired = UINT64_MAX;
     File file;
     std::atomic<std::uint64_t> length{0};
+    std::atomic<bool> frozen{false};
 };
 
 struct Chunk {
@@ -212,6 +213,7 @@ struct Chunk {
     }
 
     void publish(std::shared_ptr<ReadVersion> next, std::uint64_t length) {
+        next->frozen.store(state == State::Frozen, std::memory_order_relaxed);
         next->length.store(length, std::memory_order_release);
         version = std::move(next);
     }
@@ -411,6 +413,7 @@ struct ChunkStore::Impl {
     struct PinnedRead {
         std::shared_ptr<ReadVersion> version;
         std::uint64_t length;
+        bool frozen;
     };
 
     PinnedRead pin_read(std::string_view id) {
@@ -423,8 +426,9 @@ struct ChunkStore::Impl {
         auto& entry = cache[Hash{}(id) % cache.size()];
         if (entry.owner == this && entry.id == id) {
             if (auto version = entry.version.lock()) {
+                const bool frozen = version->frozen.load(std::memory_order_acquire);
                 auto length = version->length.load(std::memory_order_acquire);
-                if (length != ReadVersion::retired) return {std::move(version), length};
+                if (length != ReadVersion::retired) return {std::move(version), length, frozen};
             }
         }
         auto chunk = find(id);
@@ -433,7 +437,8 @@ struct ChunkStore::Impl {
         entry.id = id;
         entry.owner = this;
         entry.version = chunk->version;
-        return {chunk->version, chunk->version->length.load(std::memory_order_relaxed)};
+        return {chunk->version, chunk->version->length.load(std::memory_order_relaxed),
+                chunk->version->frozen.load(std::memory_order_acquire)};
     }
     TrafficLimiter traffic;
     std::jthread cleaner;
@@ -692,11 +697,12 @@ void ChunkStore::append_group(std::string_view id, std::span<AppendGroupItem> re
     chunk.write_failed = false;
 }
 
-void ChunkStore::read_chunk(std::string_view id, std::uint64_t offset,
-                            std::span<char> output) {
+State ChunkStore::read_chunk(std::string_view id, std::uint64_t offset,
+                             std::span<char> output) {
     auto read = impl_->pin_read(id);
     checked_read(read.length, offset, output.size());
     read_exact(read.version->file.get(), offset, output);
+    return read.frozen ? State::Frozen : State::Open;
 }
 
 std::string ChunkStore::read_chunk(std::string_view id, std::uint64_t offset,
@@ -838,6 +844,7 @@ std::uint64_t ChunkStore::freeze_chunk(std::string_view id, std::optional<std::u
         chunk.state = State::Frozen;
         sync_directory(chunk.directory);
         chunk.write_failed = false;
+        chunk.version->frozen.store(true, std::memory_order_release);
     }
     return length;
 }

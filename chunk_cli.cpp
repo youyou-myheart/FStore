@@ -51,6 +51,19 @@ void write_chunk(const Client& client, std::string_view command, char** argv) {
     }
 }
 
+template<class Client>
+void read_chunk(const Client& client, char** argv) {
+    const auto length = number(argv[5]);
+    if (length > chunkstore::max_rpc_payload) {
+        throw std::length_error("RPC payload exceeds 8 MiB");
+    }
+    const auto data = client.read_chunk(argv[3], number(argv[4]), static_cast<std::size_t>(length));
+    for (std::size_t i = 0; i < data.backing_block_num(); ++i) {
+        const auto block = data.backing_block(i);
+        std::cout.write(block.data(), block.size());
+    }
+}
+
 std::vector<std::string> split_replicas(std::string_view list) {
     std::vector<std::string> endpoints;
     for (;;) {
@@ -81,17 +94,19 @@ int main(int argc, char** argv) {
                      "       chunk_cli ENDPOINT freeze ID [EXPECTED_LENGTH]\n"
                      "       chunk_cli HOST:PORT,HOST:PORT,... create ID CAPACITY_BYTES\n"
                      "       chunk_cli HOST:PORT,HOST:PORT,... append ID OFFSET WAIT_MS FILE|-\n"
-                     "       chunk_cli HOST:PORT,HOST:PORT,... freeze ID EXPECTED_LENGTH\n";
+                     "       chunk_cli HOST:PORT,HOST:PORT,... freeze ID EXPECTED_LENGTH\n"
+                     "       chunk_cli HOST:PORT,HOST:PORT,... read ID OFFSET LENGTH\n";
         return EXIT_FAILURE;
     }
     try {
         const std::string_view endpoints = argv[1];
         if (endpoints.find(',') != endpoints.npos) {
-            if (command != "append" && command != "create" && !(command == "freeze" && argc == 5)) {
-                throw std::invalid_argument("replica list supports create, append and freeze ID EXPECTED_LENGTH");
+            if (command != "append" && command != "create" && command != "read" && !(command == "freeze" && argc == 5)) {
+                throw std::invalid_argument("replica list supports create, append, read and freeze ID EXPECTED_LENGTH");
             }
             chunkstore::ReplicatedChunkClient client(split_replicas(endpoints));
-            write_chunk(client, command, argv);
+            if (command == "read") read_chunk(client, argv);
+            else write_chunk(client, command, argv);
             std::cout.flush();
             return std::cout ? EXIT_SUCCESS : EXIT_FAILURE;
         }
@@ -116,15 +131,7 @@ int main(int argc, char** argv) {
         } else if (command == "create" || command == "append" || (command == "freeze" && argc == 5)) {
             write_chunk(client, command, argv);
         } else if (command == "read") {
-            const auto length = number(argv[5]);
-            if (length > chunkstore::max_rpc_payload) {
-                throw std::length_error("RPC payload exceeds 8 MiB");
-            }
-            const auto data = client.read_chunk(id, number(argv[4]), static_cast<std::size_t>(length));
-            for (std::size_t i = 0; i < data.backing_block_num(); ++i) {
-                const auto block = data.backing_block(i);
-                std::cout.write(block.data(), block.size());
-            }
+            read_chunk(client, argv);
         } else {
             std::cout << client.freeze_chunk(id) << '\n';
         }

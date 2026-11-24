@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from pathlib import Path
 import os
+import signal
 import subprocess
 import tempfile
 import time
@@ -97,6 +98,101 @@ def verify(nodes):
         errors=[n.endpoint + " chunk error (10)" for n in nodes])
 
 
+def verify_reads(nodes):
+    replicas = ",".join(n.endpoint for n in nodes)
+    a, b, c = nodes
+    key = "e" * 32
+    cli(replicas, "create", key, 32)
+    cli(replicas, "append", key, 0, 0, "-", data=b"hello")
+    assert cli(replicas, "read", key, 0, 5) == b"hello"
+    assert cli(replicas, "read", key, 5, 0) == b""
+    # A single success cannot form a quorum. Two identical reads can.
+    c.cli("append", key, 5, 0, "-", data=b"x")
+    cli(replicas, "read", key, 0, 6, errors=["read quorum not reached", "required 2"])
+    b.cli("append", key, 5, 0, "-", data=b"x")
+    assert cli(replicas, "read", key, 0, 6) == b"hellox"
+    # The majority may exclude the first replica, even when it returns data.
+    a.cli("append", key, 5, 0, "-", data=b"y")
+    assert cli(replicas, "read", key, 0, 6) == b"hellox"
+    cli(f"{a.endpoint},{b.endpoint}", "read", key, 0, 6,
+        errors=["read quorum not reached", "required 2"])
+    a.stop()
+    try:
+        assert cli(replicas, "read", key, 0, 6) == b"hellox"
+    finally:
+        a.start()
+    c.stop()
+    try:
+        assert cli(replicas, "read", key, 0, 5) == b"hello"
+        cli(replicas, "read", key, 0, 6, errors=["read quorum not reached", "RPC error"])
+    finally:
+        c.start()
+    # All three successful replies can still disagree.
+    for node, value in zip(nodes, (b"a", b"b", b"c")):
+        node.cli("append", key, 6, 0, "-", data=value)
+    cli(replicas, "read", key, 0, 7, errors=["read quorum not reached", "matching replicas 1/3"])
+
+    def quick_read(expected):
+        # A paused server never replies. The SDK's normal timeout is 5 s.
+        result = subprocess.run([BUILD / "chunk_cli", replicas, "read", key, "0", str(len(expected))],
+                                capture_output=True, timeout=2)
+        assert result.returncode == 0 and result.stdout == expected, result.stderr
+
+    def sdk_reads(expected, targets):
+        result = subprocess.run([BUILD / "replicated_read_test", key, expected,
+                                 *(n.endpoint for n in targets)], capture_output=True, timeout=3)
+        assert result.returncode == 0, result.stderr
+
+    sdk_reads(b"hello", [a])  # Quorum for a one-replica SDK is one.
+    c.process.send_signal(signal.SIGSTOP)
+    try:
+        quick_read(b"hello")  # Matching A and B must not wait for C.
+        sdk_reads(b"hello", nodes)
+        b.cli("freeze", key, 7)
+        quick_read(b"helloxb")  # A differs, B is frozen, C never replies.
+        sdk_reads(b"helloxb", nodes)
+        a.stop()
+        try:
+            quick_read(b"helloxb")  # First replica fails, another frozen replica suffices.
+        finally:
+            a.start()
+    finally:
+        c.process.send_signal(signal.SIGCONT)
+    # Frozen data outside the requested range does not count as a successful read.
+    cli(replicas, "read", key, 0, 8, errors=["read quorum not reached", "chunk error (4)"])
+    for preferred in nodes:
+        order = [preferred] + [node for node in nodes if node is not preferred]
+        assert cli(",".join(n.endpoint for n in order), "read", key, 0, 7) == b"helloxb"
+    # Empty frozen ranges also use the single-replica path.
+    a.stop()
+    c.stop()
+    try:
+        assert cli(replicas, "read", key, 7, 0) == b""
+    finally:
+        a.start()
+        c.start()
+
+
+def verify_replica_reads(nodes):
+    def run(mode):
+        result = subprocess.run([BUILD / "replica_reads_test", mode, *(n.endpoint for n in nodes)],
+                                capture_output=True, timeout=10)
+        assert result.returncode == 0, result.stderr
+
+    run("setup")
+    c = nodes[2]
+    c.stop()
+    try:
+        run("unavailable")
+    finally:
+        c.start()
+    c.process.send_signal(signal.SIGSTOP)
+    try:
+        run("timeout")
+    finally:
+        c.process.send_signal(signal.SIGCONT)
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
         nodes = []
@@ -105,4 +201,6 @@ if __name__ == "__main__":
             stack.callback(node.stop)
             nodes.append(node)
         verify(nodes)
-    print("three-replica commit, replay, conditional freeze and concurrent fan-out passed")
+        verify_reads(nodes)
+        verify_replica_reads(nodes)
+    print("replica writes, frozen/quorum reads, per-replica results and slow-replica handling passed")

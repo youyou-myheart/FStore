@@ -277,11 +277,11 @@ public:
             const auto length = static_cast<std::size_t>(request->length());
             auto* brpc_controller = static_cast<brpc::Controller*>(controller);
             if (length == 0) {
-                store_.read_chunk(request->chunk_id(), request->offset(), std::span<char>{});
+                response->set_frozen(store_.read_chunk(request->chunk_id(), request->offset(), std::span<char>{}) == chunkstore::State::Frozen);
                 return;
             }
             auto data = std::make_unique_for_overwrite<char[]>(length);
-            store_.read_chunk(request->chunk_id(), request->offset(), std::span(data.get(), length));
+            response->set_frozen(store_.read_chunk(request->chunk_id(), request->offset(), std::span(data.get(), length)) == chunkstore::State::Frozen);
             if (brpc_controller->response_attachment().append_user_data(
                     data.get(), length, [](void* p) { delete[] static_cast<char*>(p); }) != 0) {
                 fail(status, rpc::STORAGE_ERROR, "could not attach read data");

@@ -96,7 +96,7 @@ public:
     // Processes requests in order and syncs accepted bytes once.
     void append_group(std::string_view id, std::span<AppendGroupItem> requests);
     // Reads exactly output.size() bytes into the caller's buffer.
-    void read_chunk(std::string_view id, std::uint64_t offset, std::span<char> output);
+    State read_chunk(std::string_view id, std::uint64_t offset, std::span<char> output);
     std::string read_chunk(std::string_view id, std::uint64_t offset, std::size_t length);
     std::uint64_t delete_chunk(std::string_view id);
     State restore_chunk(std::string_view id, std::uint64_t deleted_at_ns);

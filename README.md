@@ -70,7 +70,21 @@ client.freeze_chunk(id, offset + length);
 - **部分失败**时，已落盘的字节继续保留且可读。CLI 返回非零并列出每台节点的结果，SDK 抛出 `ReplicaCommitError`，其 `replies()` 按地址输入顺序记录确认值或异常。传输错误表示结果未知。重试时使用相同的 Chunk ID、副本列表、偏移和原始数据。遇到已占用的偏移或已封存的副本，客户端会读回该范围，逐字节一致才计为确认。整个重试期间应保留同一代 Chunk，并保证每个偏移只分配给一份数据。
 - **封存**时传入已提交的最终长度。每个节点在写锁内核对自己的长度，相符才封存。落后的副本可补写后重试，已按该长度封存的副本会重复确认。此操作使用新增的 `FreezeChunkAtLength` RPC，多副本封存前须升级对应节点。
 
-运行 `python3 tests/replicated_client.py build` 可验证三个独立 server 的并发写入、节点掉线与恢复、重复提交、冲突检测和条件封存。
+多副本 SDK 提供两种读取语义，都按 `offset` 和 `length` 指定范围。
+
+整体读接口 `client.read_chunk(id, offset, length)` 返回一份 Chunk 数据，CLI 支持 `chunk_cli "$replicas" read "$id" OFFSET LENGTH`。先读取配置中的第一个副本，成功响应带 frozen 时直接返回。首个副本未冻结或读取失败时，并发读取其余副本。任意成功响应带 frozen 即可返回该数据，否则请求范围内完全相同的数据达到多数派 `floor(N/2) + 1` 即可返回，N 是配置中的副本总数。未达多数派时抛出 `ReplicaCommitError`，错误信息包括各副本的失败原因或相同内容的票数。旧服务端缺少冻结状态字段时按未冻结处理。
+
+已收到的 frozen 响应优先于未冻结数据的票数。满足 frozen 或 quorum 条件后会取消其余 RPC 并返回，多数派结果无需等待慢副本。该规则信任单个副本的冻结状态，即使其他副本尚未完成冻结也可返回。
+
+逐副本读接口 `client.read_replicas(id, offset, length)` 并发读取所有副本，等待各自成功、失败或超时后，按配置地址顺序返回 `std::vector<ReplicaReadResult>`。每项包含 `endpoint`、`data`、`frozen` 和 `error`，不同副本的数据和状态逐条保留。成功时 `data` 是原始 `butil::IOBuf`，`frozen` 是 `std::optional<bool>`，旧服务端缺少状态字段时为空。失败时 `error` 保存该副本的异常，数据和状态为空，其他副本的成功结果仍然返回。可用 `std::rethrow_exception(reply.error)` 获取 `RpcError` 或 `RemoteChunkError`。超时使用 `ClientOptions`，超过 8 MiB 的读取长度会直接抛出 `std::length_error`。
+
+```cpp
+const auto data = client.read_chunk(id, offset, length);
+const auto replicas = client.read_replicas(id, offset, length);
+// replicas[i].endpoint、data、frozen、error 对应第 i 个配置副本。
+```
+
+运行 `python3 tests/replicated_client.py build` 可验证三个独立 server 的并发写入、节点掉线与恢复、重复提交、冲突检测、条件封存、任意副本冻结读取、多数派数据比较、慢副本取消及逐副本数据与错误返回。
 
 ## 协议语义
 

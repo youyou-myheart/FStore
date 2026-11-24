@@ -4,9 +4,11 @@
 #include <brpc/channel.h>
 #include <brpc/controller.h>
 #include <bthread/bthread.h>
+#include <bthread/butex.h>
 #include <butil/endpoint.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <limits>
 #include <set>
@@ -48,6 +50,14 @@ void check_response(const brpc::Controller& controller, const Response& response
     }
     if (response.status().code() != wire::OK) {
         throw RemoteChunkError(response.status().code(), response.status().message());
+    }
+}
+
+void check_read_response(const brpc::Controller& controller, const wire::ReadResponse& response,
+                         std::size_t length) {
+    check_response(controller, response);
+    if (controller.response_attachment().size() != length) {
+        throw RpcError(EPROTO, "read attachment length mismatch");
     }
 }
 
@@ -163,6 +173,11 @@ AppendResult ChunkClient::append(std::string_view id, std::uint64_t offset,
 
 butil::IOBuf ChunkClient::read_chunk(std::string_view id, std::uint64_t offset,
                                       std::size_t length) const {
+    return read_with_state(id, offset, length).data;
+}
+
+ChunkClient::ReadResult ChunkClient::read_with_state(std::string_view id, std::uint64_t offset,
+                                                      std::size_t length) const {
     check_size(length);
     wire::ReadRequest request;
     wire::ReadResponse response;
@@ -171,13 +186,10 @@ butil::IOBuf ChunkClient::read_chunk(std::string_view id, std::uint64_t offset,
     request.set_offset(offset);
     request.set_length(length);
     impl_->stub.ReadChunk(&controller, &request, &response, nullptr);
-    check_response(controller, response);
-    if (controller.response_attachment().size() != length) {
-        throw RpcError(EPROTO, "read attachment length mismatch");
-    }
+    check_read_response(controller, response, length);
     butil::IOBuf result;
     result.swap(controller.response_attachment());
-    return result;
+    return {std::move(result), response.has_frozen() && response.frozen()};
 }
 
 std::uint64_t ChunkClient::delete_chunk(std::string_view id) const {
@@ -227,8 +239,7 @@ namespace {
 std::string describe(State state) { return state == State::Open ? "open" : "frozen"; }
 std::string describe(std::uint64_t length) { return std::to_string(length); }
 
-std::string describe_replies(const std::vector<ReplicaReply>& replies) {
-    std::string message = "replica commit incomplete";
+std::string describe_replies(const std::vector<ReplicaReply>& replies, std::string message) {
     for (const auto& reply : replies) {
         message += "\n  " + reply.endpoint + " ";
         if (!reply.error) {
@@ -251,8 +262,8 @@ std::string describe_replies(const std::vector<ReplicaReply>& replies) {
 }
 }
 
-ReplicaCommitError::ReplicaCommitError(std::vector<ReplicaReply> replies)
-    : std::runtime_error(describe_replies(replies)), replies_(std::move(replies)) {}
+ReplicaCommitError::ReplicaCommitError(std::vector<ReplicaReply> replies, std::string message)
+    : std::runtime_error(describe_replies(replies, std::move(message))), replies_(std::move(replies)) {}
 
 ReplicatedChunkClient::ReplicatedChunkClient(const std::vector<std::string>& endpoints, ClientOptions options) {
     if (endpoints.empty()) throw std::invalid_argument("at least one replica is required");
@@ -320,6 +331,177 @@ auto ReplicatedChunkClient::commit(const Operation& operation) const {
         replies.push_back({nodes_[i].endpoint, call.error ? "" : describe(call.value), call.error});
     }
     throw ReplicaCommitError(std::move(replies));
+}
+
+butil::IOBuf ReplicatedChunkClient::read_chunk(std::string_view id, std::uint64_t offset,
+                                              std::size_t length) const {
+    check_size(length);
+    ChunkClient::ReadResult first;
+    std::exception_ptr first_error;
+    try {
+        first = nodes_.front().client->read_with_state(id, offset, length);
+        if (first.frozen || nodes_.size() == 1) return std::move(first.data);
+    } catch (...) {
+        first_error = std::current_exception();
+    }
+
+    // Each callback owns the batch until it finishes. This lets a successful
+    // read cancel pending calls and return without joining slow replicas.
+    struct Batch {
+        struct Call : google::protobuf::Closure {
+            brpc::Controller controller;
+            wire::ReadResponse response;
+            ChunkClient::ReadResult result;
+            std::exception_ptr error;
+            std::shared_ptr<Batch> owner;
+            std::atomic<bool> ready{false};
+            brpc::CallId call_id{};
+            bool started = false;
+            bool consumed = false;
+
+            void Run() override {
+                auto batch = std::move(owner);
+                try {
+                    check_read_response(controller, response, batch->request.length());
+                    result.frozen = response.has_frozen() && response.frozen();
+                    result.data.swap(controller.response_attachment());
+                } catch (...) {
+                    error = std::current_exception();
+                }
+                ready.store(true, std::memory_order_release);
+                batch->completed->fetch_add(1, std::memory_order_release);
+                bthread::butex_wake(batch->completed);
+            }
+        };
+
+        explicit Batch(std::size_t size) : calls(size) {
+            completed = bthread::butex_create_checked<std::atomic<int>>();
+            if (!completed) throw std::bad_alloc();
+            completed->store(1, std::memory_order_relaxed);
+        }
+        ~Batch() { bthread::butex_destroy(completed); }
+
+        wire::ReadRequest request;
+        std::vector<Call> calls;
+        std::atomic<int>* completed;
+    };
+    const auto batch = std::make_shared<Batch>(nodes_.size());
+    batch->request.set_chunk_id(std::string(id));
+    batch->request.set_offset(offset);
+    batch->request.set_length(length);
+    batch->calls.front().result = std::move(first);
+    batch->calls.front().error = first_error;
+    batch->calls.front().ready.store(true, std::memory_order_relaxed);
+
+    struct Vote {
+        std::size_t representative;
+        std::size_t count;
+    };
+    std::vector<Vote> votes;
+    votes.reserve(nodes_.size());
+    struct CancelPending {
+        const std::shared_ptr<Batch>& batch;
+        ~CancelPending() {
+            for (auto& call : batch->calls) {
+                if (call.started && !call.ready.load(std::memory_order_acquire)) {
+                    brpc::StartCancel(call.call_id);
+                }
+            }
+        }
+    } cancel{batch};
+    for (std::size_t i = 1; i < nodes_.size(); ++i) {
+        auto& call = batch->calls[i];
+        call.call_id = call.controller.call_id();
+        call.owner = batch;
+        call.started = true;
+        nodes_[i].client->impl_->stub.ReadChunk(&call.controller, &batch->request, &call.response, &call);
+    }
+
+    const auto quorum = nodes_.size() / 2 + 1;
+    std::size_t remaining = nodes_.size();
+    while (remaining != 0) {
+        const auto completed = batch->completed->load(std::memory_order_acquire);
+        for (std::size_t i = 0; i < batch->calls.size(); ++i) {
+            auto& call = batch->calls[i];
+            if (call.consumed || !call.ready.load(std::memory_order_acquire)) continue;
+            call.consumed = true;
+            --remaining;
+            if (call.error) continue;
+            if (call.result.frozen) return std::move(call.result.data);
+            const auto match = std::find_if(votes.begin(), votes.end(), [&](const Vote& vote) {
+                return batch->calls[vote.representative].result.data.equals(call.result.data);
+            });
+            if (match == votes.end()) votes.push_back({i, 1});
+            else ++match->count;
+        }
+        // Prefer any frozen response already received over the open votes.
+        for (const auto& vote : votes) {
+            if (vote.count >= quorum) return std::move(batch->calls[vote.representative].result.data);
+        }
+        if (remaining != 0) bthread::butex_wait(batch->completed, completed, nullptr);
+    }
+
+    std::vector<ReplicaReply> replies;
+    for (std::size_t i = 0; i < batch->calls.size(); ++i) {
+        const auto& call = batch->calls[i];
+        std::string acknowledgement;
+        if (!call.error) {
+            const auto match = std::find_if(votes.begin(), votes.end(), [&](const Vote& vote) {
+                return batch->calls[vote.representative].result.data.equals(call.result.data);
+            });
+            acknowledgement = "read " + std::to_string(length) + " bytes, matching replicas " +
+                              std::to_string(match->count) + "/" + std::to_string(nodes_.size());
+        }
+        replies.push_back({nodes_[i].endpoint, std::move(acknowledgement), call.error});
+    }
+    throw ReplicaCommitError(std::move(replies),
+                             "replica read quorum not reached, required " + std::to_string(quorum));
+}
+
+std::vector<ReplicaReadResult> ReplicatedChunkClient::read_replicas(
+        std::string_view id, std::uint64_t offset, std::size_t length) const {
+    check_size(length);
+    std::vector<ReplicaReadResult> replies(nodes_.size());
+    for (std::size_t i = 0; i < nodes_.size(); ++i) {
+        replies[i].endpoint = nodes_[i].endpoint;
+    }
+    wire::ReadRequest request;
+    request.set_chunk_id(std::string(id));
+    request.set_offset(offset);
+    request.set_length(length);
+    struct Call {
+        brpc::Controller controller;
+        wire::ReadResponse response;
+        bool started = false;
+        void join() {
+            if (started) {
+                brpc::Join(controller.call_id());
+                started = false;
+            }
+        }
+        ~Call() { join(); }
+    };
+    // Start every RPC before waiting. Keep the request and all controllers live
+    // through completion, including if a later launch throws.
+    std::vector<Call> calls(nodes_.size());
+    for (std::size_t i = 0; i < nodes_.size(); ++i) {
+        auto& call = calls[i];
+        nodes_[i].client->impl_->stub.ReadChunk(&call.controller, &request, &call.response, brpc::DoNothing());
+        call.started = true;
+    }
+    for (std::size_t i = 0; i < calls.size(); ++i) {
+        auto& call = calls[i];
+        auto& reply = replies[i];
+        call.join();
+        try {
+            check_read_response(call.controller, call.response, length);
+            if (call.response.has_frozen()) reply.frozen = call.response.frozen();
+            reply.data.swap(call.controller.response_attachment());
+        } catch (...) {
+            reply.error = std::current_exception();
+        }
+    }
+    return replies;
 }
 
 State ReplicatedChunkClient::create_chunk(std::string_view id, std::uint64_t capacity) const {
