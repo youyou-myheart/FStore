@@ -1,0 +1,179 @@
+syntax = "proto3";
+
+package fstore.master.v1;
+option cc_generic_services = true;
+
+enum Code {
+  OK = 0;
+  INVALID_ARGUMENT = 1;
+  NOT_FOUND = 2;
+  CONFLICT = 3;
+  STORAGE_ERROR = 4;
+}
+
+message Status {
+  Code code = 1;
+  string message = 2;
+}
+
+message Disk {
+  string id = 1;
+  string path = 2;
+  bool disabled = 3;
+}
+
+message FServer {
+  string id = 1;
+  string endpoint = 2;
+  bool disabled = 3;
+  repeated Disk disks = 4;
+}
+
+message Topology {
+  uint64 revision = 1;
+  repeated FServer servers = 2;
+}
+
+enum DiskHealth {
+  DISK_UNKNOWN = 0;
+  DISK_HEALTHY = 1;
+  DISK_ERROR = 2;
+  DISK_STALE = 3;
+}
+
+message DiskReport {
+  string id = 1;
+  string path = 2;
+  bool healthy = 3;
+  uint64 total_bytes = 4;
+  uint64 free_bytes = 5;
+  uint64 available_bytes = 6;
+  string error = 7;
+  DiskHealth health = 8;
+  uint64 observed_unix_ms = 9;
+}
+
+message ServerStatus {
+  string server_id = 1;
+  bool online = 2;
+  uint64 last_heartbeat_unix_ms = 3;
+  repeated DiskReport disks = 4;
+  uint64 last_probe_unix_ms = 5;
+  string error = 6;
+}
+
+message ListRequest {
+  // Empty selects all configured servers.
+  string server_id = 1;
+}
+message ListResponse {
+  Status status = 1;
+  Topology topology = 2;
+  repeated ServerStatus servers = 3;
+}
+
+message SetServerRequest {
+  string id = 1;
+  string endpoint = 2;
+  bool disabled = 3;
+  optional uint64 expected_revision = 4;
+}
+
+message SetDiskRequest {
+  string server_id = 1;
+  Disk disk = 2;
+  optional uint64 expected_revision = 3;
+}
+
+message SetServerStateRequest {
+  // State-only update; preserves the endpoint and disk configuration.
+  string id = 1;
+  bool disabled = 2;
+  optional uint64 expected_revision = 3;
+}
+
+message SetDiskStateRequest {
+  // State-only update; preserves the disk path and other disk configuration.
+  string server_id = 1;
+  string disk_id = 2;
+  bool disabled = 3;
+  optional uint64 expected_revision = 4;
+}
+
+message RemoveServerRequest {
+  string id = 1;
+  optional uint64 expected_revision = 2;
+}
+
+message RemoveDiskRequest {
+  string server_id = 1;
+  string disk_id = 2;
+  optional uint64 expected_revision = 3;
+}
+
+message ApplyConfigRequest {
+  Topology topology = 1;
+  optional uint64 expected_revision = 2;
+}
+
+message MutationResponse {
+  Status status = 1;
+  uint64 revision = 2;
+}
+
+message ValidateConfigRequest {
+  Topology topology = 1;
+}
+
+message ValidateConfigResponse {
+  Status status = 1;
+  // Normalized preview with revision 0; no configuration is persisted.
+  Topology topology = 2;
+}
+
+message ProbeNowRequest {
+  // Empty requests a probe of every configured server.
+  string server_id = 1;
+}
+
+message ProbeNowResponse {
+  Status status = 1;
+  // Accepted targets, including probes already in flight. Read List for results.
+  uint32 scheduled_servers = 2;
+}
+
+message HeartbeatReport {
+  string server_id = 1;
+  // Configuration revision used to collect these reports.
+  uint64 config_revision = 2;
+  repeated DiskReport disks = 3;
+  // The reporting process's advertised chunk service address.
+  string endpoint = 4;
+}
+
+message ServerHeartbeatRequest {
+  FServer server = 1;
+  uint64 config_revision = 2;
+}
+
+message ServerHeartbeatResponse {
+  Status status = 1;
+  HeartbeatReport report = 2;
+}
+
+service FServerStatusService {
+  rpc Heartbeat(ServerHeartbeatRequest) returns (ServerHeartbeatResponse);
+}
+
+service FMasterService {
+  rpc List(ListRequest) returns (ListResponse);
+  rpc SetServer(SetServerRequest) returns (MutationResponse);
+  rpc SetDisk(SetDiskRequest) returns (MutationResponse);
+  rpc SetServerState(SetServerStateRequest) returns (MutationResponse);
+  rpc SetDiskState(SetDiskStateRequest) returns (MutationResponse);
+  rpc RemoveServer(RemoveServerRequest) returns (MutationResponse);
+  rpc RemoveDisk(RemoveDiskRequest) returns (MutationResponse);
+  rpc ApplyConfig(ApplyConfigRequest) returns (MutationResponse);
+  rpc ValidateConfig(ValidateConfigRequest) returns (ValidateConfigResponse);
+  rpc ProbeNow(ProbeNowRequest) returns (ProbeNowResponse);
+}

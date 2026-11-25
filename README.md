@@ -1,6 +1,6 @@
-# Chunk Server
+# FStore
 
-Linux C++20 单机 Chunk 服务，使用 Apache bRPC 的二进制 `baidu_std` 协议。每个 Chunk 对应一个普通文件，文件中存放原始字节，`.open` 和 `.frozen` 后缀表示状态。数据目录由服务进程独占。
+Linux C++20 存储服务，包含 FMaster 集群配置与状态管理，以及 FServer Chunk 服务，使用 Apache bRPC 的二进制 `baidu_std` 协议。每个 Chunk 对应一个普通文件，文件中存放原始字节，`.open` 和 `.frozen` 后缀表示状态。数据目录由服务进程独占。
 
 ## 编译与启动
 
@@ -16,6 +16,93 @@ mkdir -p data
 服务位置参数为 `DATA_DIR [ADDRESS:PORT [MAX_CONCURRENCY [RATE_MIB_S]]]`，默认 `127.0.0.1:8080` 、64 个并发在线 RPC 和 256 MiB/s 的节点总额度。磁盘操作在独立工作线程池执行。Chunk 接口只接受 `baidu_std`，bRPC 内置服务已关闭。
 
 服务端按 Chunk 调度写请求。每次最多合并 32 个偏移连续的追加请求，合计最多 8 MiB，共用一次落盘同步。创建、封存、删除和恢复作为批次边界。每个请求独立检查剩余容量并返回各自的偏移。
+
+## FMaster 配置与状态管理
+
+`fmaster` 使用 bRPC `baidu_std` 管理 FServer 清单和每台 FServer 的盘配置。每台服务有稳定 ID、RPC 地址和启用状态，每块盘有 ID、绝对路径和启用状态。盘路径位于对应 FServer 主机上。当前版本运行一个 FMaster，配置保存在独占的数据目录中，变更成功响应前完成持久化。
+
+首次启动可通过 protobuf 文本配置导入服务和盘，例如 `cluster.pbtxt`。
+
+```text
+servers {
+  id: "fs1"
+  endpoint: "10.0.0.1:8080"
+  disks { id: "disk1" path: "/data/fstore" }
+  disks { id: "disk2" path: "/data/fstore2" disabled: true }
+}
+```
+
+```sh
+mkdir -p master-data
+./build/fmaster --data-dir=master-data --listen=10.0.0.10:8090 --config=cluster.pbtxt
+./build/fmaster_cli 10.0.0.10:8090 list
+./build/fmaster_cli 10.0.0.10:8090 server-set fs2 10.0.0.2:8080 enabled
+./build/fmaster_cli 10.0.0.10:8090 disk-set fs2 disk1 /data/fstore enabled
+./build/fmaster_cli 10.0.0.10:8090 disk-set fs2 disk1 /data/fstore disabled
+./build/fmaster_cli 10.0.0.10:8090 disk-remove fs2 disk1
+./build/fmaster_cli 10.0.0.10:8090 server-remove fs2
+```
+
+管理命令支持集群概览、节点和盘详情、容量与异常列表、持续查看和配置导出。查看命令默认输出表格，追加 `--json` 可供脚本读取；`list` 保持完整 JSON 输出。完整参数和输出说明见 [FMaster 命令手册](docs/fmaster_commands.md)。
+
+```sh
+./build/fmaster_cli --help
+./build/fmaster_cli 10.0.0.10:8090 status
+./build/fmaster_cli 10.0.0.10:8090 servers --offline
+./build/fmaster_cli 10.0.0.10:8090 disk fs1 disk1
+./build/fmaster_cli 10.0.0.10:8090 capacity fs1
+./build/fmaster_cli 10.0.0.10:8090 errors
+./build/fmaster_cli 10.0.0.10:8090 watch --interval-ms=1000
+./build/fmaster_cli 10.0.0.10:8090 server-disable fs1
+./build/fmaster_cli 10.0.0.10:8090 server-enable fs1
+./build/fmaster_cli 10.0.0.10:8090 disk-disable fs1 disk1
+./build/fmaster_cli 10.0.0.10:8090 disk-enable fs1 disk1
+./build/fmaster_cli 10.0.0.10:8090 probe fs1
+./build/fmaster_cli 10.0.0.10:8090 config > cluster-backup.pbtxt
+./build/fmaster_cli 10.0.0.10:8090 validate cluster-backup.pbtxt
+```
+
+`server-enable/disable` 和 `disk-enable/disable` 原子更新启用状态并保留其他配置，支持 `--expected-revision=N`。`probe` 请求立即探测并返回接受的节点数，结果通过查看命令获取。`validate` 返回规范化后的配置，当前配置保持不变。容量逐盘显示，包含观测时间和健康状态，同一文件系统下的多个目录不汇总计算总容量。
+
+`server-set` 保留该服务已有的盘配置，`disk-set` 创建或替换指定盘配置。移除服务时同时移除它的盘登记。启用和禁用记录管理员配置意图，FMaster 通过主动心跳获取运行状态。Chunk 数据目录由启动参数 `DATA_DIR` 指定，盘配置用于清单与状态管理。移除登记仅修改 FMaster 配置。
+
+启动的 `--config` 仅在数据目录首次初始化时使用。之后重启会加载持久化配置，命令行修改继续生效。显式调用 `fmaster_cli ENDPOINT apply FILE` 可原子替换整份配置。修改命令返回新的配置版本号，追加 `--expected-revision=N` 可以只在当前版本为 N 时更新，版本冲突时返回错误。配置校验覆盖重复服务 ID、地址、盘 ID 和同一服务内的盘路径，盘路径必须为绝对路径。
+
+FServer 在 Chunk RPC 端口提供心跳接口，通过稳定的 ID 和服务地址校验探测对象。
+
+```sh
+./build/chunk_server /data/fstore 10.0.0.1:8080 --server-id=fs1
+# 监听全部网卡时，指定已登记的服务地址。
+./build/chunk_server /data/fstore 0.0.0.0:8080 --server-id=fs1 --advertise=10.0.0.1:8080
+```
+
+FMaster 按盘配置向每个 FServer 发起心跳，FServer 采集目录所在文件系统的总空间、空闲空间和普通用户可用空间，返回每块盘的可访问状态。缺失、无法访问或类型错误的目录附带错误信息。两个目录位于同一文件系统时，空间统计反映同一个文件系统。
+
+FMaster 默认每 2 秒探测一次，单次 RPC 超时 1 秒，10 秒未成功时将节点标记为离线。分别使用 `--heartbeat-interval-ms`、`--probe-timeout-ms` 和 `--heartbeat-timeout-ms` 调整。各节点独立调度，一台节点超时期间其他节点继续被探测。`list` 输出 JSON，包含配置、在线状态、最近探测与成功时间、错误，以及每个配置盘的状态和空间信息。
+
+盘状态为 `DISK_UNKNOWN`、`DISK_HEALTHY`、`DISK_ERROR` 或 `DISK_STALE`。未完成探测时为 UNKNOWN，路径访问失败为 ERROR，节点离线后历史容量附带 STALE 标记与原观测时间。配置启用状态与运行状态分别记录，禁用的节点也会被探测。FMaster 重启后重新探测所有节点。
+
+## Onebox 与测试
+
+本机 onebox 默认启动 1 个 FMaster、3 个 FServer，每个 FServer 登记 2 个盘目录。各进程有独立的数据目录和日志，端口自动分配。Chunk 数据使用每台 FServer 的第一个目录，全部盘目录参加状态探测。
+
+```sh
+python3 tools/onebox.py up --build-dir build --root /tmp/fstore-onebox
+python3 tools/onebox.py status --root /tmp/fstore-onebox
+python3 tools/onebox.py check --root /tmp/fstore-onebox
+python3 tools/onebox.py down --root /tmp/fstore-onebox
+```
+
+`down` 停止该集群的进程并保留数据、配置与日志，再次 `up` 使用已保存的配置恢复。`check` 检查节点和盘状态，并执行多副本读写、冻结和修复。
+
+```sh
+python3 tools/run_tests.py --build-dir build
+python3 tools/run_tests.py --build-dir build --skip-build --suite unit
+python3 tools/run_tests.py --build-dir build --skip-build --suite integration
+python3 tools/run_tests.py --build-dir build --skip-build --suite e2e
+```
+
+测试入口配置并编译项目后运行 CTest，日志写入 `build/test-results`，支持 JUnit 的 CTest 还会生成 XML 报告。测试分类、故障场景和运行环境见 [测试说明](docs/testing.md)。
 
 ## 客户端
 

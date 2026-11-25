@@ -3,6 +3,7 @@
 #include "chunk_repair.hpp"
 #include "chunk_rpc_limits.hpp"
 #include "chunk.pb.h"
+#include "fserver_heartbeat.hpp"
 
 #include <brpc/closure_guard.h>
 #include <brpc/controller.h>
@@ -786,7 +787,8 @@ int main(int argc, char** argv) {
     while (options_begin < argc && !std::string_view(argv[options_begin]).starts_with("--")) ++options_begin;
     if (argc < 2 || options_begin > 5) {
         std::cerr << "usage: chunk_server DATA_DIR [ADDRESS:PORT [MAX_CONCURRENCY [RATE_MIB_S]]]"
-                     " [--worker-poll=sleep|<N>us|busy] [--poll-workers=N]\n";
+                     " [--worker-poll=sleep|<N>us|busy] [--poll-workers=N]"
+                     " [--server-id=ID [--advertise=HOST:PORT]]\n";
         return EXIT_FAILURE;
     }
     const char* endpoint = options_begin > 2 ? argv[2] : "127.0.0.1:8080";
@@ -811,16 +813,47 @@ int main(int argc, char** argv) {
         rate = mib << 20;
     }
     try {
+        std::optional<std::string> server_id;
+        std::optional<std::string> advertised_endpoint;
+        std::vector<char*> polling_arguments;
+        for (int i = options_begin; i < argc; ++i) {
+            const std::string_view argument = argv[i];
+            constexpr std::string_view id_flag = "--server-id=";
+            constexpr std::string_view advertise_flag = "--advertise=";
+            if (argument.starts_with(id_flag) && !server_id) {
+                server_id = argument.substr(id_flag.size());
+            } else if (argument.starts_with(advertise_flag) && !advertised_endpoint) {
+                advertised_endpoint = argument.substr(advertise_flag.size());
+            } else {
+                polling_arguments.push_back(argv[i]);
+            }
+        }
+        if (server_id && (server_id->empty() || server_id->size() > 64 ||
+            server_id->find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-") !=
+                std::string::npos)) {
+            throw std::invalid_argument("--server-id must be 1..64 letters, digits, dots, underscores or hyphens");
+        }
+        if (advertised_endpoint && (!server_id || advertised_endpoint->empty())) {
+            throw std::invalid_argument("--advertise requires --server-id and a nonempty HOST:PORT");
+        }
         // A worker can sleep in fdatasync. Give unrelated chunk IDs more lanes
         // than CPU cores, bounded by the configured number of outstanding RPCs.
         const auto workers = std::min(static_cast<unsigned>(concurrency),
             4 * std::clamp(std::thread::hardware_concurrency(), 4u, 16u));
-        const auto polling = parse_polling(std::span(argv + options_begin, argc - options_begin), workers);
+        const auto polling = parse_polling(polling_arguments, workers);
         chunkstore::ChunkStore store(argv[1], rate);
         Service service(store, workers, static_cast<unsigned>(concurrency), polling);
-        brpc::FLAGS_max_body_size = chunkstore::max_rpc_payload + 64 * 1024;
+        std::unique_ptr<chunkstore::FServerStatusService> heartbeat;
+        if (server_id) {
+            heartbeat = std::make_unique<chunkstore::FServerStatusService>(
+                *server_id, advertised_endpoint.value_or(endpoint));
+        }
+        brpc::FLAGS_max_body_size = (server_id ? 16 * 1024 * 1024 : chunkstore::max_rpc_payload) + 64 * 1024;
         brpc::Server server;
         if (server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
+            return EXIT_FAILURE;
+        }
+        if (heartbeat && server.AddService(heartbeat.get(), brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
             return EXIT_FAILURE;
         }
         brpc::ServerOptions options;
