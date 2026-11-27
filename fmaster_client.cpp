@@ -127,4 +127,76 @@ wire::ProbeNowResponse Client::probe_now(const std::string& server_id) const {
     return response;
 }
 
+wire::SpaceResponse Client::create_space(const wire::CreateSpaceRequest& request) const {
+    wire::SpaceResponse response;
+    brpc::Controller controller;
+    impl_->stub.CreateSpace(&controller, &request, &response, nullptr);
+    check_response(controller, response);
+    return response;
+}
+
+wire::SpaceResponse Client::bind_pgs(const wire::BindPGsRequest& request) const {
+    wire::SpaceResponse response;
+    brpc::Controller controller;
+    impl_->stub.BindPGs(&controller, &request, &response, nullptr);
+    check_response(controller, response);
+    return response;
+}
+
+wire::SpaceResponse Client::unbind_pgs(const wire::BindPGsRequest& request) const {
+    wire::SpaceResponse response;
+    brpc::Controller controller;
+    impl_->stub.UnbindPGs(&controller, &request, &response, nullptr);
+    check_response(controller, response);
+    return response;
+}
+
+wire::ListPGPoolResponse Client::list_pg_pool(const wire::ListPGPoolRequest& request) const {
+    wire::ListPGPoolResponse response;
+    brpc::Controller controller;
+    impl_->stub.ListPGPool(&controller, &request, &response, nullptr);
+    check_response(controller, response);
+    return response;
+}
+
+wire::ListSpacesResponse Client::list_spaces(const wire::ListSpacesRequest& request) const {
+    wire::ListSpacesResponse response;
+    brpc::Controller controller;
+    impl_->stub.ListSpaces(&controller, &request, &response, nullptr);
+    check_response(controller, response);
+    return response;
+}
+
+wire::ListPGsResponse Client::list_pgs(const wire::ListPGsRequest& request) const {
+    wire::ListPGsResponse response;
+    brpc::Controller controller;
+    impl_->stub.ListPGs(&controller, &request, &response, nullptr);
+    check_response(controller, response);
+    return response;
+}
+
+wire::AllocateBlobsResponse Client::allocate_blobs(const wire::AllocateBlobsRequest& request) const {
+    wire::AllocateBlobsResponse response;
+    brpc::Controller controller;
+    impl_->stub.AllocateBlobs(&controller, &request, &response, nullptr);
+    check_response(controller, response);
+    return response;
+}
+
+wire::AllocateChunksResponse Client::allocate_chunks(const wire::AllocateChunksRequest& request) const {
+    wire::AllocateChunksResponse response;
+    brpc::Controller controller;
+    impl_->stub.AllocateChunks(&controller, &request, &response, nullptr);
+    check_response(controller, response);
+    return response;
+}
+
+wire::LocateChunkResponse Client::locate_chunk(const wire::LocateChunkRequest& request) const {
+    wire::LocateChunkResponse response;
+    brpc::Controller controller;
+    impl_->stub.LocateChunk(&controller, &request, &response, nullptr);
+    check_response(controller, response);
+    return response;
+}
+
 } // namespace chunkstore::master

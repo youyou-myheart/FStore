@@ -1,4 +1,5 @@
 #include "chunk_store.hpp"
+#include "chunk_id.hpp"
 
 #include <algorithm>
 #include <array>
@@ -95,14 +96,15 @@ bool expired(std::uint64_t timestamp, std::uint64_t now) {
 
 bool expired_entry(std::string_view name, std::string_view shard, std::uint64_t now) {
     const auto suffix = name.rfind('.');
+    const auto separator = name.find('.');
     if (suffix == name.npos || (name.substr(suffix) != ".open" && name.substr(suffix) != ".frozen") ||
-        suffix <= 33 || !name.starts_with(shard) || name[32] != '.' ||
-        name.substr(0, 32).find_first_not_of(hex) != name.npos) {
+        separator == name.npos || suffix <= separator + 1 || !name.starts_with(shard) ||
+        !valid_storage_chunk_id(name.substr(0, separator))) {
         return false;
     }
     std::uint64_t timestamp = 0;
     const char* end = name.data() + suffix;
-    const auto parsed = std::from_chars(name.data() + 33, end, timestamp);
+    const auto parsed = std::from_chars(name.data() + separator + 1, end, timestamp);
     return parsed.ec == std::errc{} && parsed.ptr == end && timestamp != 0 && expired(timestamp, now);
 }
 
@@ -344,8 +346,8 @@ struct ChunkStore::Impl {
     }
 
     std::shared_ptr<Chunk> find(std::string_view id, bool create = false, bool repair = false) {
-        if (id.size() != 32 || id.find_first_not_of(hex) != std::string_view::npos) {
-            throw std::invalid_argument("chunk ID must be 32 lowercase hex digits");
+        if (!valid_storage_chunk_id(id)) {
+            throw std::invalid_argument("chunk ID must be 30 lowercase hex digits (legacy 24/32-digit IDs are also accepted)");
         }
         auto& index = index_for(id);
         {
@@ -762,7 +764,7 @@ std::uint64_t ChunkStore::delete_chunk(std::string_view id) {
 }
 
 State ChunkStore::restore_chunk(std::string_view id, std::uint64_t timestamp) {
-    if (id.size() != 32 || id.find_first_not_of(hex) != id.npos || timestamp == 0) {
+    if (!valid_storage_chunk_id(id) || timestamp == 0) {
         throw std::invalid_argument("invalid chunk ID or deletion timestamp");
     }
     if (expired(timestamp, unix_nanoseconds())) {

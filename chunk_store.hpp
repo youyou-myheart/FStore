@@ -72,7 +72,8 @@ public:
     using std::logic_error::logic_error;
 };
 
-// Owns an existing Linux directory. IDs are 32 lowercase hex digits.
+// Owns an existing Linux directory. IDs are 30 lowercase hex digits (120 bits).
+// Existing 24/32-digit IDs remain supported for compatibility.
 // Operations are thread-safe. Finish them before destroying the store.
 class ChunkStore {
 public:

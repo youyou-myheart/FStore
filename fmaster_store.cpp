@@ -1,4 +1,6 @@
 #include "fmaster_store.hpp"
+#include "fmaster_placement.hpp"
+#include "chunk_id.hpp"
 
 #include <butil/crc32c.h>
 #include <butil/endpoint.h>
@@ -143,6 +145,7 @@ void normalize(wire::Topology& topology, bool resolve_hostnames = true) {
     std::set<std::string> servers, endpoints;
     for (auto& server : *topology.mutable_servers()) {
         validate_id(server.id());
+        if (!server.datacenter().empty()) validate_id(server.datacenter());
         if (!servers.insert(server.id()).second) throw Error(wire::INVALID_ARGUMENT, "duplicate FServer ID: " + server.id());
         if (!endpoints.insert(endpoint_key(server.endpoint(), resolve_hostnames)).second) {
             throw Error(wire::INVALID_ARGUMENT, "duplicate FServer endpoint: " + server.endpoint());
@@ -253,6 +256,37 @@ struct Store::Impl {
             persist(topology);
         }
         for (const auto& server : topology.servers()) changed_revisions.emplace(server.id(), topology.revision());
+        const auto spaces = read_file(root / "spaces.pb", max_config_bytes + 16, true);
+        if (spaces) {
+            const auto& bytes = *spaces;
+            if (bytes.size() < 16 || (bytes.substr(0, 8) != "FSPACE01" && bytes.substr(0, 8) != "FSPACE02" && bytes.substr(0, 8) != "FSPACE03") ||
+                read_u32(std::string_view(bytes).substr(8, 4)) != bytes.size() - 16 ||
+                read_u32(std::string_view(bytes).substr(12, 4)) != butil::crc32c::Value(bytes.data() + 16, bytes.size() - 16) ||
+                !catalog.ParseFromArray(bytes.data() + 16, static_cast<int>(bytes.size() - 16))) {
+                throw Error(wire::STORAGE_ERROR, "invalid space catalog snapshot");
+            }
+            if (bytes.substr(0, 8) != "FSPACE03") {
+                if (!catalog.spaces().empty() || catalog.reserved_blob_sequence()) {
+                    throw Error(wire::STORAGE_ERROR, "legacy Space/PG and Chunk ID layouts require explicit migration");
+                }
+                catalog.set_next_space_id(0);
+                placement::validate_catalog(catalog);
+                persist_catalog(catalog);
+            }
+            placement::validate_catalog(catalog);
+            placement::validate_topology(catalog, topology);
+            File snapshot(::open((root / "spaces.pb").c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+            sync_file(snapshot.fd);
+            sync_file(directory_file->fd);
+        } else {
+            catalog.set_revision(1);
+            catalog.set_next_space_id(0);
+            persist_catalog(catalog);
+        }
+        for (const auto& state : catalog.spaces()) {
+            // Unused reserved IDs are deliberately skipped after every restart.
+            cursors.emplace(state.space().id(), state.blob_sequences().empty() ? 0 : state.blob_sequences().rbegin()->end());
+        }
     }
 
     void ensure_available() const {
@@ -315,6 +349,7 @@ struct Store::Impl {
                 return previous == topology.mutable_servers()->end() || previous->endpoint() != server.endpoint();
             });
         normalize(candidate, endpoints_changed);
+        placement::validate_topology(catalog, candidate);
         candidate.set_revision(topology.revision());
         if (candidate.SerializeAsString() == topology.SerializeAsString()) return topology.revision();
         if (topology.revision() == std::numeric_limits<std::uint64_t>::max()) {
@@ -342,11 +377,162 @@ struct Store::Impl {
         return topology.revision();
     }
 
+    void persist_catalog(const wire::SpaceCatalog& candidate) {
+        const auto payload = candidate.SerializeAsString();
+        if (payload.size() > max_config_bytes) throw Error(wire::INVALID_ARGUMENT, "space catalog exceeds 16 MiB");
+        std::string bytes = "FSPACE03";
+        append_u32(bytes, static_cast<std::uint32_t>(payload.size()));
+        append_u32(bytes, butil::crc32c::Value(payload.data(), payload.size()));
+        bytes += payload;
+        try {
+            File file(::open((root / ".spaces.tmp").c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600));
+            std::size_t offset = 0;
+            while (offset < bytes.size()) {
+                const auto count = ::write(file.fd, bytes.data() + offset, bytes.size() - offset);
+                if (count < 0 && errno == EINTR) continue;
+                if (count < 0) system_failure("write space catalog");
+                if (count == 0) throw Error(wire::STORAGE_ERROR, "space catalog write made no progress");
+                offset += static_cast<std::size_t>(count);
+            }
+            sync_file(file.fd);
+            if (::rename((root / ".spaces.tmp").c_str(), (root / "spaces.pb").c_str()) != 0) system_failure("publish space catalog");
+            sync_file(directory_file->fd);
+        } catch (...) {
+            storage_failed = true;
+            throw;
+        }
+    }
+
+    template<class Request>
+    void check_space_revision(const Request& request) const {
+        ensure_available();
+        if (request.has_expected_revision() && request.expected_revision() != catalog.revision()) {
+            throw Error(wire::CONFLICT, "space catalog revision changed; current revision " + std::to_string(catalog.revision()));
+        }
+    }
+
+    void publish_catalog(wire::SpaceCatalog& candidate) {
+        if (catalog.revision() == UINT64_MAX) throw Error(wire::CONFLICT, "space revision exhausted");
+        candidate.set_revision(catalog.revision() + 1);
+        placement::validate_catalog(candidate);
+        persist_catalog(candidate);
+        catalog.Swap(&candidate);
+    }
+
+    wire::SpaceState& find_space(const std::string& name) {
+        ensure_available();
+        validate_id(name);
+        for (auto& state : *catalog.mutable_spaces()) if (state.space().name() == name) return state;
+        throw Error(wire::NOT_FOUND, "space not found: " + name);
+    }
+
+    bool eligible(const wire::FServer& server) const {
+        if (server.disabled()) return false;
+        const auto live = live_servers.find(server.id());
+        if (live == live_servers.end() || !live->second.seen ||
+            Clock::now() - *live->second.seen >= heartbeat_timeout || !live->second.status.error().empty()) return false;
+        for (const auto& disk : server.disks()) {
+            if (disk.disabled()) continue;
+            for (const auto& report : live->second.status.disks()) {
+                if (disk.id() == report.id() && disk.path() == report.path() && report.healthy()) return true;
+            }
+        }
+        return false;
+    }
+
+    static void compact_ranges(wire::SpaceState& state) {
+        std::vector<wire::PGRange> ranges(state.ranges().begin(), state.ranges().end());
+        std::sort(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) { return a.begin() < b.begin(); });
+        state.clear_ranges();
+        std::uint32_t bound = 0;
+        for (const auto& range : ranges) {
+            bound += range.end() - range.begin();
+            if (!state.ranges().empty() && state.ranges().rbegin()->end() == range.begin()) {
+                auto* previous = state.mutable_ranges(state.ranges_size() - 1);
+                auto comparable = *previous;
+                comparable.set_begin(range.begin());
+                comparable.set_end(range.end());
+                if (comparable.SerializeAsString() == range.SerializeAsString()) {
+                    previous->set_end(range.end());
+                    continue;
+                }
+            }
+            *state.add_ranges() = range;
+        }
+        state.mutable_space()->set_bound_pgs(bound);
+    }
+
+    void bind_range(wire::SpaceState& state, std::uint32_t start, std::uint32_t count) const {
+        if (!count || start >= placement::pg_count || count > placement::pg_count - start) {
+            throw Error(wire::INVALID_ARGUMENT, "PG interval must be nonempty and within 0..9999999");
+        }
+        const auto end = start + count;
+        for (const auto& owner : catalog.spaces()) {
+            if (owner.space().id() == state.space().id()) continue;
+            for (const auto& range : owner.ranges()) {
+                if (range.begin() < end && start < range.end()) {
+                    throw Error(wire::CONFLICT, "global PG already belongs to Space " + owner.space().name());
+                }
+            }
+        }
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> gaps;
+        auto cursor = start;
+        for (const auto& range : state.ranges()) {
+            if (range.end() <= cursor) continue;
+            if (range.begin() >= end) break;
+            if (range.begin() > cursor) gaps.emplace_back(cursor, range.begin());
+            cursor = std::max(cursor, range.end());
+            if (cursor >= end) break;
+        }
+        if (cursor < end) gaps.emplace_back(cursor, end);
+        if (gaps.empty()) return;
+        wire::PGRange pool;
+        pool.set_algorithm_version(1);
+        const auto& policy = state.space().spec().placement_policy();
+        for (const auto& server : topology.servers()) {
+            if (!eligible(server) || (policy.mode() != wire::PlacementPolicy::SINGLE_DATACENTER && server.datacenter().empty())) continue;
+            if (!policy.datacenters().empty() &&
+                std::find(policy.datacenters().begin(), policy.datacenters().end(), server.datacenter()) == policy.datacenters().end()) continue;
+            auto* node = pool.add_candidates();
+            node->set_server_id(server.id());
+            node->set_endpoint(server.endpoint());
+            node->set_datacenter(server.datacenter());
+        }
+        for (const auto& [begin, finish] : gaps) {
+            pool.set_begin(begin); pool.set_end(finish);
+            *state.add_ranges() = pool;
+        }
+        compact_ranges(state);
+        for (const auto& gap : gaps) placement::group(state, gap.first);
+    }
+
+    void bind_initial(wire::SpaceState& state) const {
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> used;
+        for (const auto& owner : catalog.spaces()) {
+            for (const auto& range : owner.ranges()) used.emplace_back(range.begin(), range.end());
+        }
+        std::sort(used.begin(), used.end());
+        used.emplace_back(placement::pg_count, placement::pg_count);
+        std::uint32_t cursor = 0, remaining = 200;
+        for (const auto& [begin, end] : used) {
+            if (begin > cursor) {
+                const auto take = std::min(remaining, begin - cursor);
+                bind_range(state, cursor, take);
+                remaining -= take;
+                if (!remaining) return;
+            }
+            cursor = std::max(cursor, end);
+        }
+        throw Error(wire::CONFLICT, "global PG pool has fewer than 200 free PGs");
+    }
+
     fs::path root;
     std::unique_ptr<File> directory_file, lock_file;
     std::chrono::milliseconds heartbeat_timeout, heartbeat_interval;
     mutable std::mutex mutex;
     wire::Topology topology;
+    wire::SpaceCatalog catalog;
+    std::unordered_map<std::uint32_t, std::uint64_t> cursors;
     std::unordered_map<std::string, LiveServer> live_servers;
     std::unordered_map<std::string, std::uint64_t> changed_revisions;
     bool storage_failed = false;
@@ -413,6 +599,7 @@ std::uint64_t Store::set_server(const wire::SetServerRequest& request) {
         server->set_id(request.id());
         server->set_endpoint(request.endpoint());
         server->set_disabled(request.disabled());
+        if (request.has_datacenter()) server->set_datacenter(request.datacenter());
     });
 }
 
@@ -479,10 +666,267 @@ void Store::validate_config(const wire::ValidateConfigRequest& request, wire::Va
     if (!request.has_topology()) throw Error(wire::INVALID_ARGUMENT, "topology is required");
     auto topology = request.topology();
     normalize(topology);
+    {
+        std::lock_guard lock(impl_->mutex);
+        impl_->ensure_available();
+        placement::validate_topology(impl_->catalog, topology);
+    }
     topology.set_revision(0);
     response.Clear();
     response.mutable_status();
     response.mutable_topology()->Swap(&topology);
+}
+
+void Store::create_space(const wire::CreateSpaceRequest& request, wire::SpaceResponse& response) {
+    std::lock_guard lock(impl_->mutex);
+    impl_->check_space_revision(request);
+    validate_id(request.name());
+    auto spec = request.spec();
+    placement::normalize_spec(spec);
+    for (const auto& state : impl_->catalog.spaces()) {
+        if (state.space().name() != request.name()) continue;
+        if (state.space().spec().SerializeAsString() != spec.SerializeAsString()) {
+            throw Error(wire::CONFLICT, "space already exists with a different specification");
+        }
+        response.Clear();
+        response.mutable_status();
+        response.set_revision(impl_->catalog.revision());
+        *response.mutable_space() = state.space();
+        return;
+    }
+    if (impl_->catalog.next_space_id() > 255) throw Error(wire::CONFLICT, "space identifiers exhausted");
+    auto candidate = impl_->catalog;
+    auto* state = candidate.add_spaces();
+    auto* space = state->mutable_space();
+    space->set_name(request.name());
+    space->set_id(static_cast<std::uint32_t>(candidate.next_space_id()));
+    space->set_total_pgs(placement::pg_count);
+    *space->mutable_spec() = spec;
+    candidate.set_next_space_id(candidate.next_space_id() + 1);
+    impl_->bind_initial(*state);
+    wire::SpaceResponse result;
+    result.mutable_status();
+    *result.mutable_space() = *space;
+    impl_->publish_catalog(candidate);
+    result.set_revision(impl_->catalog.revision());
+    response.Swap(&result);
+}
+
+void Store::bind_pgs(const wire::BindPGsRequest& request, wire::SpaceResponse& response) {
+    std::lock_guard lock(impl_->mutex);
+    impl_->check_space_revision(request);
+    const auto old = impl_->find_space(request.name());
+    auto updated = old;
+    impl_->bind_range(updated, request.start(), request.count());
+    if (updated.SerializeAsString() != old.SerializeAsString()) {
+        auto candidate = impl_->catalog;
+        for (auto& state : *candidate.mutable_spaces()) {
+            if (state.space().id() == old.space().id()) { state = updated; break; }
+        }
+        impl_->publish_catalog(candidate);
+    }
+    response.Clear(); response.mutable_status();
+    response.set_revision(impl_->catalog.revision());
+    *response.mutable_space() = updated.space();
+}
+
+void Store::unbind_pgs(const wire::BindPGsRequest& request, wire::SpaceResponse& response) {
+    std::lock_guard lock(impl_->mutex);
+    impl_->check_space_revision(request);
+    if (!request.count() || request.start() >= placement::pg_count || request.count() > placement::pg_count - request.start()) {
+        throw Error(wire::INVALID_ARGUMENT, "PG interval must be nonempty and within 0..9999999");
+    }
+    const auto old = impl_->find_space(request.name());
+    auto updated = old;
+    updated.clear_ranges();
+    const auto end = request.start() + request.count();
+    bool changed = false;
+    for (const auto& range : old.ranges()) {
+        if (range.end() <= request.start() || range.begin() >= end) {
+            *updated.add_ranges() = range;
+            continue;
+        }
+        changed = true;
+        if (range.begin() < request.start()) {
+            auto* left = updated.add_ranges(); *left = range; left->set_end(request.start());
+        }
+        if (range.end() > end) {
+            auto* right = updated.add_ranges(); *right = range; right->set_begin(end);
+        }
+    }
+    if (changed) {
+        if (!old.blob_sequences().empty()) throw Error(wire::CONFLICT, "Space has issued Blob sequences; unbinding requires data migration");
+        Impl::compact_ranges(updated);
+        auto candidate = impl_->catalog;
+        for (auto& state : *candidate.mutable_spaces()) {
+            if (state.space().id() == old.space().id()) { state = updated; break; }
+        }
+        impl_->publish_catalog(candidate);
+    }
+    response.Clear(); response.mutable_status();
+    response.set_revision(impl_->catalog.revision());
+    *response.mutable_space() = updated.space();
+}
+
+void Store::list_pg_pool(const wire::ListPGPoolRequest& request, wire::ListPGPoolResponse& response) const {
+    std::lock_guard lock(impl_->mutex);
+    impl_->ensure_available();
+    const auto limit = request.limit() ? request.limit() : 100;
+    if (request.start() > placement::pg_count || limit > 1000) throw Error(wire::INVALID_ARGUMENT, "invalid global PG page");
+    response.Clear(); response.mutable_status();
+    response.set_revision(impl_->catalog.revision()); response.set_total_pgs(placement::pg_count);
+    std::uint32_t bound = 0;
+    for (const auto& state : impl_->catalog.spaces()) bound += state.space().bound_pgs();
+    response.set_bound_pgs(bound);
+    const auto end = std::min(placement::pg_count, request.start() + limit);
+    for (auto id = request.start(); id < end; ++id) {
+        auto* item = response.add_pgs(); item->mutable_pg()->set_id(id);
+        for (const auto& state : impl_->catalog.spaces()) {
+            if (!placement::owns_pg(state, id)) continue;
+            item->set_space_name(state.space().name());
+            *item->mutable_pg() = placement::group(state, id);
+            break;
+        }
+    }
+    if (end < placement::pg_count) response.set_next_start(end);
+}
+
+void Store::list_spaces(const wire::ListSpacesRequest& request, wire::ListSpacesResponse& response) const {
+    std::lock_guard lock(impl_->mutex);
+    impl_->ensure_available();
+    response.Clear();
+    response.mutable_status();
+    response.set_revision(impl_->catalog.revision());
+    if (!request.name().empty()) *response.add_spaces() = impl_->find_space(request.name()).space();
+    else for (const auto& state : impl_->catalog.spaces()) *response.add_spaces() = state.space();
+}
+
+void Store::list_pgs(const wire::ListPGsRequest& request, wire::ListPGsResponse& response) const {
+    std::lock_guard lock(impl_->mutex);
+    const auto& state = impl_->find_space(request.name());
+    const auto limit = request.limit() ? request.limit() : 100;
+    if (request.start() > placement::pg_count || limit > 1000) throw Error(wire::INVALID_ARGUMENT, "invalid PG page");
+    response.Clear(); response.mutable_status();
+    response.set_revision(impl_->catalog.revision());
+    *response.mutable_space() = state.space();
+    if (request.include_inactive()) {
+        const auto end = std::min(placement::pg_count, request.start() + limit);
+        for (auto id = request.start(); id < end; ++id) *response.add_pgs() = placement::group(state, id);
+        if (end < placement::pg_count) response.set_next_start(end);
+    } else {
+        auto next = placement::next_cursor(state, request.start());
+        while (next && *next < placement::pg_count && response.pgs_size() < static_cast<int>(limit)) {
+            *response.add_pgs() = placement::group(state, static_cast<std::uint32_t>(*next));
+            next = placement::next_cursor(state, *next + 1);
+        }
+        if (next && *next < placement::pg_count) response.set_next_start(static_cast<std::uint32_t>(*next));
+    }
+}
+
+void Store::allocate_blobs(const wire::AllocateBlobsRequest& request, wire::AllocateBlobsResponse& response) {
+    std::lock_guard lock(impl_->mutex);
+    const auto& state = impl_->find_space(request.name());
+    const auto count = request.count() ? request.count() : 1;
+    if (count > 1024) throw Error(wire::INVALID_ARGUMENT, "Blob allocation count must be in 1..1024");
+    if (!state.space().bound_pgs()) throw Error(wire::CONFLICT, "space has no bound PGs");
+    const auto space_id = state.space().id();
+    const auto reserved = state.blob_sequences().empty() ? 0 : state.blob_sequences().rbegin()->end();
+    auto& cursor = impl_->cursors.try_emplace(space_id, reserved).first->second;
+    const bool reserve = count > reserved - cursor;
+    auto first = cursor;
+    wire::SpaceCatalog candidate;
+    if (reserve) {
+        const auto global = impl_->catalog.reserved_blob_sequence();
+        if (count > ChunkId::max_sequence - global) throw Error(wire::CONFLICT, "Blob sequences exhausted");
+        const auto last = global + std::min<std::uint64_t>(4096, ChunkId::max_sequence - global);
+        first = global;
+        candidate = impl_->catalog;
+        candidate.set_reserved_blob_sequence(last);
+        for (auto& item : *candidate.mutable_spaces()) {
+            if (item.space().id() != space_id) continue;
+            if (!item.blob_sequences().empty() && item.blob_sequences().rbegin()->end() == global) {
+                item.mutable_blob_sequences(item.blob_sequences_size() - 1)->set_end(last);
+            } else {
+                auto* range = item.add_blob_sequences();
+                range->set_begin(global + 1);
+                range->set_end(last);
+            }
+            break;
+        }
+    }
+    wire::AllocateBlobsResponse result;
+    result.mutable_status();
+    result.set_revision(impl_->catalog.revision());
+    for (std::uint64_t offset = 1; offset <= count; ++offset) {
+        auto* blob = result.add_blobs();
+        blob->set_seq_id(first + offset);
+        blob->set_space_id(space_id);
+        blob->set_start_cursor(placement::initial_cursor(state, first + offset));
+    }
+    if (reserve) {
+        impl_->persist_catalog(candidate);
+        impl_->catalog.Swap(&candidate);
+    }
+    cursor = first + count;
+    response.Swap(&result);
+}
+
+void Store::allocate_chunks(const wire::AllocateChunksRequest& request, wire::AllocateChunksResponse& response) {
+    std::lock_guard lock(impl_->mutex);
+    const auto& state = impl_->find_space(request.name());
+    const auto count = request.count() ? request.count() : 1;
+    if (count > 1024) throw Error(wire::INVALID_ARGUMENT, "chunk count must be in 1..1024");
+    if (!state.space().bound_pgs()) throw Error(wire::CONFLICT, "space has no bound PGs");
+    if (!placement::owns_blob(state, request.seq_id())) throw Error(wire::NOT_FOUND, "Blob sequence does not belong to this Space");
+    std::unordered_map<std::string, bool> eligible;
+    for (const auto& server : impl_->topology.servers()) eligible.emplace(server.id(), impl_->eligible(server));
+    wire::AllocateChunksResponse result;
+    result.mutable_status();
+    result.set_revision(impl_->catalog.revision());
+    const auto start = request.has_start_cursor() ? request.start_cursor() :
+        placement::initial_cursor(state, request.seq_id());
+    auto cursor = placement::next_cursor(state, start);
+    // A batch may visit a PG more than once when few PGs are bound. Select and
+    // validate its replicas once per request, retaining a single health view.
+    std::unordered_map<std::uint32_t, wire::PlacementGroup> routes;
+    routes.reserve(std::min(count, state.space().bound_pgs()));
+    for (std::uint32_t offset = 0; offset < count; ++offset) {
+        if (!cursor) throw Error(wire::CONFLICT, "64-bit Chunk allocation cursor exhausted");
+        const auto pg = static_cast<std::uint32_t>(*cursor % placement::pg_count);
+        const auto index = unhash_chunk_index(*cursor);
+        auto* chunk = result.add_chunks();
+        chunk->set_chunk_id(placement::chunk_id(state.space().id(), request.seq_id(), index));
+        *chunk->mutable_space() = state.space();
+        auto [route, inserted] = routes.try_emplace(pg);
+        if (inserted) {
+            route->second = placement::group(state, pg);
+            for (const auto& replica : route->second.replicas()) {
+                if (!eligible.at(replica.server_id())) {
+                    throw Error(wire::CONFLICT, "PG replica is unavailable or administratively disabled: " + replica.server_id());
+                }
+            }
+        }
+        *chunk->mutable_pg() = route->second;
+        cursor = *cursor == UINT64_MAX ? std::nullopt : placement::next_cursor(state, *cursor + 1);
+    }
+    if (cursor) result.set_next_cursor(*cursor);
+    response.Swap(&result);
+}
+
+void Store::locate_chunk(const wire::LocateChunkRequest& request, wire::LocateChunkResponse& response) const {
+    const auto id = placement::decode_id(request.chunk_id());
+    std::lock_guard lock(impl_->mutex);
+    const auto& state = impl_->find_space(request.name());
+    if (id.space != state.space().id() || !placement::owns_blob(state, id.sequence) || !placement::owns_pg(state, id.pg)) {
+        throw Error(wire::NOT_FOUND, "chunk ID does not belong to this space's allocated namespace");
+    }
+    response.Clear();
+    response.mutable_status();
+    response.set_revision(impl_->catalog.revision());
+    auto* chunk = response.mutable_chunk();
+    chunk->set_chunk_id(request.chunk_id());
+    *chunk->mutable_space() = state.space();
+    *chunk->mutable_pg() = placement::group(state, id.pg);
 }
 
 void Store::record_heartbeat(const wire::HeartbeatReport& request) {

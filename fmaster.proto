@@ -27,6 +27,7 @@ message FServer {
   string endpoint = 2;
   bool disabled = 3;
   repeated Disk disks = 4;
+  string datacenter = 5;
 }
 
 message Topology {
@@ -77,6 +78,8 @@ message SetServerRequest {
   string endpoint = 2;
   bool disabled = 3;
   optional uint64 expected_revision = 4;
+  // Omitted preserves an existing server's location.
+  optional string datacenter = 5;
 }
 
 message SetDiskRequest {
@@ -176,4 +179,145 @@ service FMasterService {
   rpc ApplyConfig(ApplyConfigRequest) returns (MutationResponse);
   rpc ValidateConfig(ValidateConfigRequest) returns (ValidateConfigResponse);
   rpc ProbeNow(ProbeNowRequest) returns (ProbeNowResponse);
+  rpc CreateSpace(CreateSpaceRequest) returns (SpaceResponse);
+  rpc BindPGs(BindPGsRequest) returns (SpaceResponse);
+  rpc UnbindPGs(BindPGsRequest) returns (SpaceResponse);
+  rpc ListPGPool(ListPGPoolRequest) returns (ListPGPoolResponse);
+  rpc ListSpaces(ListSpacesRequest) returns (ListSpacesResponse);
+  rpc ListPGs(ListPGsRequest) returns (ListPGsResponse);
+  rpc AllocateChunks(AllocateChunksRequest) returns (AllocateChunksResponse);
+  rpc AllocateBlobs(AllocateBlobsRequest) returns (AllocateBlobsResponse);
+  rpc LocateChunk(LocateChunkRequest) returns (LocateChunkResponse);
+}
+
+message PlacementPolicy {
+  enum Mode {
+    SINGLE_DATACENTER = 0;
+    BALANCED_DATACENTERS = 1;
+    DISTINCT_DATACENTERS = 2;
+  }
+  Mode mode = 1;
+  // Default 1, 2, or replicas according to mode.
+  uint32 min_datacenters = 2;
+  // Empty permits every eligible datacenter.
+  repeated string datacenters = 3;
+}
+message SpaceSpec {
+  uint32 replicas = 1;
+  uint64 chunk_size = 2;
+  PlacementPolicy placement_policy = 3;
+}
+message Space {
+  string name = 1;
+  uint32 id = 2; // Encoded in 8 bits: 0..255.
+  SpaceSpec spec = 3;
+  uint32 total_pgs = 4; // Fixed GLOBAL namespace: 10,000,000 PGs.
+  uint32 bound_pgs = 5; // Number of PGs bound to this Space, not a prefix length.
+}
+message ReplicaTarget {
+  string server_id = 1;
+  string endpoint = 2;
+  string datacenter = 3;
+}
+message PlacementGroup {
+  uint32 id = 1;
+  bool active = 2;
+  repeated ReplicaTarget replicas = 3;
+}
+message ChunkRoute {
+  string chunk_id = 1; // 30 hex digits: seq_id:48 | space_id:8 | index:64.
+  Space space = 2;
+  PlacementGroup pg = 3;
+}
+message CreateSpaceRequest {
+  string name = 1;
+  SpaceSpec spec = 2;
+  reserved 3; // Creation always binds 200 globally free PGs.
+  optional uint64 expected_revision = 4; // Space catalog revision, not topology revision.
+}
+message BindPGsRequest {
+  string name = 1;
+  uint32 start = 2; // Global PG ID, inclusive.
+  uint32 count = 3;
+  optional uint64 expected_revision = 4;
+}
+message ListPGPoolRequest { uint32 start = 1; uint32 limit = 2; }
+message PGOwnership { PlacementGroup pg = 1; string space_name = 2; }
+message ListPGPoolResponse {
+  Status status = 1;
+  uint64 revision = 2;
+  uint32 total_pgs = 3;
+  uint32 bound_pgs = 4;
+  repeated PGOwnership pgs = 5;
+  optional uint32 next_start = 6;
+}
+message SpaceResponse {
+  Status status = 1;
+  uint64 revision = 2;
+  Space space = 3;
+}
+message ListSpacesRequest { string name = 1; }
+message ListSpacesResponse {
+  Status status = 1;
+  uint64 revision = 2;
+  repeated Space spaces = 3;
+}
+message ListPGsRequest {
+  string name = 1;
+  uint32 start = 2;
+  uint32 limit = 3; // Default 100, maximum 1,000.
+  bool include_inactive = 4;
+}
+message ListPGsResponse {
+  Status status = 1;
+  uint64 revision = 2;
+  Space space = 3;
+  repeated PlacementGroup pgs = 4;
+  optional uint32 next_start = 5;
+}
+message AllocateChunksRequest {
+  string name = 1;
+  uint32 count = 2; // Default 1, maximum 1,024.
+  uint64 seq_id = 3; // Required: a Blob sequence allocated in this Space.
+  // Inclusive lower bound in hash(index) space; not an index. When omitted,
+  // choose a deterministic start distributed across this Space's bound PGs.
+  optional uint64 start_cursor = 4;
+}
+message AllocateChunksResponse {
+  Status status = 1;
+  uint64 revision = 2;
+  repeated ChunkRoute chunks = 3;
+  optional uint64 next_cursor = 4; // Missing means the uint64 hash space is exhausted.
+}
+message Blob {
+  uint64 seq_id = 1;
+  uint32 space_id = 2;
+  // Retain with seq_id for a stable first allocation across new PG bindings.
+  uint64 start_cursor = 3;
+}
+message AllocateBlobsRequest { string name = 1; uint32 count = 2; }
+message AllocateBlobsResponse { Status status = 1; uint64 revision = 2; repeated Blob blobs = 3; }
+message LocateChunkRequest { string name = 1; string chunk_id = 2; }
+message LocateChunkResponse { Status status = 1; uint64 revision = 2; ChunkRoute chunk = 3; }
+
+// Internal durable metadata. An immutable pool per bound global PG range makes
+// placement reproducible without materializing ten million PG records.
+message PGRange {
+  uint32 begin = 1;
+  uint32 end = 2;
+  repeated ReplicaTarget candidates = 3;
+  uint32 algorithm_version = 4;
+}
+message SpaceState {
+  Space space = 1;
+  uint64 reserved_sequence = 2; // Version 1 only; never reinterpret old Chunk IDs.
+  repeated PGRange ranges = 3;
+  repeated BlobSequenceRange blob_sequences = 4;
+}
+message BlobSequenceRange { uint64 begin = 1; uint64 end = 2; } // Inclusive, durable reservations.
+message SpaceCatalog {
+  uint64 revision = 1;
+  uint64 next_space_id = 2;
+  repeated SpaceState spaces = 3;
+  uint64 reserved_blob_sequence = 4; // Globally unique Blob sequences across Spaces.
 }

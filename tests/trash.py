@@ -17,7 +17,7 @@ def wait_until_gone(path):
 
 
 def verify(node):
-    key = "a" * 32
+    key = "a" * 30
     shard = node.root / "aa"
     trash = shard / ".trash"
     node.cli("create", key, 4)
@@ -64,22 +64,36 @@ def verify(node):
     _, error = pending.communicate(timeout=3)
     assert pending.returncode != 0 and b"chunk error (2)" in error
 
+    key96 = "ab" * 12
+    node.cli("create", key96, 4)
+    node.cli("append", key96, 0, 0, "-", data=b"blob")
+    token96 = int(node.cli("delete", key96))
+    assert node.cli("restore", key96, token96) == b"open\n"
+    assert node.cli("read", key96, 0, 4) == b"blob"
+    token96 = int(node.cli("delete", key96))
+
     # Simulate elapsed wall-clock time using isolated entries in the test directory.
     node.stop()
     old = time.time_ns() - 25 * 3600 * 10**9
     aged = trash / f"{key}.{old}.open"
     (trash / f"{key}.{fresh}.open").rename(aged)
+    trash96 = node.root / "ab" / ".trash"
+    aged96 = trash96 / f"{key96}.{old}.open"
+    (trash96 / f"{key96}.{token96}.open").rename(aged96)
     unrelated = trash / "unrelated"
     unrelated.write_bytes(b"keep")
     future = trash / f"{key}.{time.time_ns() + 1000}.open"
     future.write_bytes(b"keep")
     node.start()
     wait_until_gone(aged)
+    wait_until_gone(aged96)
     node.cli("restore", key, old, error=b"chunk error (2)")
     # Add an expired entry after startup to exercise the periodic worker.
     aged.write_bytes(b"expired")
+    aged96.write_bytes(b"expired96")
     node.cli("restore", key, old, error=b"chunk error (2)")
     wait_until_gone(aged)
+    wait_until_gone(aged96)
     assert future.read_bytes() == unrelated.read_bytes() == b"keep"
     assert node.cli("read", key, 0, 1) == b"z"
 

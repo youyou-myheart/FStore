@@ -82,6 +82,22 @@ FMaster 默认每 2 秒探测一次，单次 RPC 超时 1 秒，10 秒未成功�
 
 盘状态为 `DISK_UNKNOWN`、`DISK_HEALTHY`、`DISK_ERROR` 或 `DISK_STALE`。未完成探测时为 UNKNOWN，路径访问失败为 ERROR，节点离线后历史容量附带 STALE 标记与原观测时间。配置启用状态与运行状态分别记录，禁用的节点也会被探测。FMaster 重启后重新探测所有节点。
 
+## Space 与 PG
+
+FMaster 为全集群管理固定的 10,000,000 个逻辑 PG。每个 PG 独占绑定一个 Space，Space 创建时自动领取 200 个全局空闲 PG，后续由运维通过绑定与解绑命令调整。Space 独立配置副本数、Chunk 大小和 `placement_policy`。
+
+Chunk ID 为 `seq_id:48 | space_id:8 | index:64`，共 120 位。PG 由固定的 `hash(index) % 10,000,000` 决定，副本路由必须与 Space 的 PG 绑定一致。
+
+```sh
+./build/fmaster_cli 10.0.0.10:8090 space-create logs 3 67108864 --placement=single-dc
+./build/fmaster_cli 10.0.0.10:8090 pg-pool 0 500
+./build/fmaster_cli 10.0.0.10:8090 pg-bind logs 7000000 200
+./build/fmaster_cli 10.0.0.10:8090 blob-allocate logs 1
+./build/fmaster_cli 10.0.0.10:8090 allocate logs SEQ_ID START_CURSOR 10
+```
+
+索引通过可逆哈希直接生成，使用 `next_cursor` 分批分配；index 本身不保证递增。默认起点按 Blob 分散到已绑定 PG，避免小 Blob 集中在第一个 PG。`SpaceClient` 根据路由执行多副本读写，并缓存最多 256 套副本客户端供不同 Chunk 复用。元数据、独占绑定、分配游标与 SDK 用法见 [Space 与 PG 说明](docs/spaces.md)。
+
 ## Onebox 与测试
 
 本机 onebox 默认启动 1 个 FMaster、3 个 FServer，每个 FServer 登记 2 个盘目录。各进程有独立的数据目录和日志，端口自动分配。Chunk 数据使用每台 FServer 的第一个目录，全部盘目录参加状态探测。
@@ -185,7 +201,7 @@ const auto replicas = client.read_replicas(id, offset, length);
 | `DeleteChunk` | Chunk ID | 本次删除的 Unix 纳秒时间戳，用于恢复 |
 | `RestoreChunk` | Chunk ID、删除时间戳 | 恢复后的 OPEN 或 FROZEN 状态 |
 
-协议定义见 `chunk.proto`。Chunk ID 为 32 位小写十六进制字符。单次追加、读取各限 8 MiB。小记录可以用 `butil::IOBuf` 拼成一个请求，共用一次落盘同步。追加在同步成功后才返回。客户端用 `RpcError` 表示 RPC 调用失败，用 `RemoteChunkError` 表示服务端业务错误。
+协议定义见 `chunk.proto`。Chunk ID 为 120 位（`seq_id:48 | space_id:8 | index:64`），使用 30 位小写十六进制字符串。仅 index 的固定哈希决定全局 PG，同一 Blob 共用序号；底层接口兼容已有的 24/32 位十六进制 ID。单次追加、读取各限 8 MiB。小记录可以用 `butil::IOBuf` 拼成一个请求，共用一次落盘同步。追加在同步成功后才返回。客户端用 `RpcError` 表示 RPC 调用失败，用 `RemoteChunkError` 表示服务端业务错误。
 
 容量必须为正数，创建后固定。容量保存在 Chunk 文件的 Linux 扩展属性中，存储文件系统必须支持 `user.*` 扩展属性。文件长度随写入增长。恰好写满时追加成功，超过剩余容量的请求整批返回 `CHUNK_FULL`。同 ID 使用不同容量创建会返回 `CAPACITY_MISMATCH`。
 

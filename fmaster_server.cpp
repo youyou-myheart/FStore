@@ -96,6 +96,49 @@ public:
         });
     }
 
+    void CreateSpace(google::protobuf::RpcController*, const wire::CreateSpaceRequest* request,
+                    wire::SpaceResponse* response, google::protobuf::Closure* done) override {
+        complete(done, response, [&] { store_.create_space(*request, *response); });
+    }
+
+    void BindPGs(google::protobuf::RpcController*, const wire::BindPGsRequest* request,
+                 wire::SpaceResponse* response, google::protobuf::Closure* done) override {
+        complete(done, response, [&] { store_.bind_pgs(*request, *response); });
+    }
+    void UnbindPGs(google::protobuf::RpcController*, const wire::BindPGsRequest* request,
+                   wire::SpaceResponse* response, google::protobuf::Closure* done) override {
+        complete(done, response, [&] { store_.unbind_pgs(*request, *response); });
+    }
+    void ListPGPool(google::protobuf::RpcController*, const wire::ListPGPoolRequest* request,
+                    wire::ListPGPoolResponse* response, google::protobuf::Closure* done) override {
+        complete(done, response, [&] { store_.list_pg_pool(*request, *response); });
+    }
+
+    void ListSpaces(google::protobuf::RpcController*, const wire::ListSpacesRequest* request,
+                    wire::ListSpacesResponse* response, google::protobuf::Closure* done) override {
+        complete(done, response, [&] { store_.list_spaces(*request, *response); });
+    }
+
+    void ListPGs(google::protobuf::RpcController*, const wire::ListPGsRequest* request,
+                    wire::ListPGsResponse* response, google::protobuf::Closure* done) override {
+        complete(done, response, [&] { store_.list_pgs(*request, *response); });
+    }
+
+    void AllocateBlobs(google::protobuf::RpcController*, const wire::AllocateBlobsRequest* request,
+                       wire::AllocateBlobsResponse* response, google::protobuf::Closure* done) override {
+        complete(done, response, [&] { store_.allocate_blobs(*request, *response); });
+    }
+
+    void AllocateChunks(google::protobuf::RpcController*, const wire::AllocateChunksRequest* request,
+                    wire::AllocateChunksResponse* response, google::protobuf::Closure* done) override {
+        complete(done, response, [&] { store_.allocate_chunks(*request, *response); });
+    }
+
+    void LocateChunk(google::protobuf::RpcController*, const wire::LocateChunkRequest* request,
+                    wire::LocateChunkResponse* response, google::protobuf::Closure* done) override {
+        complete(done, response, [&] { store_.locate_chunk(*request, *response); });
+    }
+
 private:
     master::Store& store_;
     master::Monitor& monitor_;

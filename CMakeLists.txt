@@ -20,7 +20,7 @@ add_library(fmaster_rpc STATIC ${MASTER_PROTO_SOURCES} ${MASTER_PROTO_HEADERS})
 target_include_directories(fmaster_rpc PUBLIC "${CMAKE_CURRENT_BINARY_DIR}")
 target_link_libraries(fmaster_rpc PUBLIC protobuf::libprotobuf PkgConfig::BRPC Threads::Threads)
 
-add_library(fmaster_store STATIC fmaster_store.cpp)
+add_library(fmaster_store STATIC fmaster_store.cpp fmaster_placement.cpp)
 target_include_directories(fmaster_store PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(fmaster_store PUBLIC fmaster_rpc)
 
@@ -41,6 +41,10 @@ add_library(chunk_client STATIC chunk_client.cpp)
 target_include_directories(chunk_client PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(chunk_client PUBLIC chunk_rpc)
 
+add_library(space_client STATIC space_client.cpp space_client_validation.cpp)
+target_include_directories(space_client PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(space_client PUBLIC chunk_client fmaster_client)
+
 add_executable(chunk_server chunk_server.cpp chunk_repair.cpp fserver_heartbeat.cpp)
 target_link_libraries(chunk_server PRIVATE chunk_store chunk_rpc fmaster_rpc)
 
@@ -49,6 +53,31 @@ target_link_libraries(chunk_cli PRIVATE chunk_client)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(chunk_id_test tests/chunk_id.cpp)
+    target_include_directories(chunk_id_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME chunk_id COMMAND chunk_id_test)
+    add_executable(fmaster_spaces_test tests/fmaster_spaces.cpp)
+    target_link_libraries(fmaster_spaces_test PRIVATE fmaster_store)
+    add_test(NAME fmaster_spaces COMMAND fmaster_spaces_test)
+    add_executable(fmaster_placement_test tests/fmaster_placement.cpp)
+    target_link_libraries(fmaster_placement_test PRIVATE fmaster_store)
+    add_test(NAME fmaster_placement COMMAND fmaster_placement_test)
+    add_executable(fmaster_batch_test tests/fmaster_batch.cpp)
+    target_link_libraries(fmaster_batch_test PRIVATE fmaster_store)
+    add_test(NAME fmaster_batch COMMAND fmaster_batch_test)
+    add_executable(replica_client_pool_test tests/replica_client_pool.cpp)
+    target_include_directories(replica_client_pool_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(replica_client_pool_test PRIVATE Threads::Threads)
+    add_test(NAME replica_client_pool COMMAND replica_client_pool_test)
+    add_executable(space_client_validation_test tests/space_client_validation.cpp)
+    target_link_libraries(space_client_validation_test PRIVATE space_client)
+    add_test(NAME space_client_validation COMMAND space_client_validation_test)
+    add_executable(space_client_test tests/space_client.cpp)
+    target_link_libraries(space_client_test PRIVATE space_client)
+    add_executable(space_pool_test tests/space_pool.cpp)
+    target_link_libraries(space_pool_test PRIVATE space_client)
+    add_test(NAME space_pool COMMAND space_pool_test)
+    set_tests_properties(space_pool PROPERTIES LABELS "integration" TIMEOUT 30)
     add_executable(fmaster_probe_test tests/fmaster_probe.cpp)
     target_link_libraries(fmaster_probe_test PRIVATE fmaster_rpc)
     add_executable(fmaster_store_test tests/fmaster_store.cpp)
@@ -64,13 +93,17 @@ if(BUILD_TESTING)
     add_executable(read_version_test tests/read_version.cpp)
     target_link_libraries(read_version_test PRIVATE chunk_store)
     add_test(NAME read_version COMMAND read_version_test)
-    set_tests_properties(fmaster_store traffic_limiter read_version PROPERTIES LABELS "unit" TIMEOUT 30)
+    set_tests_properties(chunk_id fmaster_store fmaster_spaces fmaster_placement fmaster_batch
+                         replica_client_pool space_client_validation traffic_limiter read_version
+                         PROPERTIES LABELS "unit" TIMEOUT 30)
     find_package(Python3 QUIET COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
         add_test(NAME fmaster COMMAND "${Python3_EXECUTABLE}" -B
                  "${CMAKE_CURRENT_SOURCE_DIR}/tests/fmaster.py" "$<TARGET_FILE_DIR:fmaster_cli>")
         add_test(NAME fmaster_commands COMMAND "${Python3_EXECUTABLE}" -B
                  "${CMAKE_CURRENT_SOURCE_DIR}/tests/fmaster_commands.py" "$<TARGET_FILE_DIR:fmaster_cli>")
+        add_test(NAME space_integration COMMAND "${Python3_EXECUTABLE}" -B
+                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/spaces.py" "$<TARGET_FILE_DIR:fmaster_cli>")
         add_test(NAME replicated_client COMMAND "${Python3_EXECUTABLE}" -B
                  "${CMAKE_CURRENT_SOURCE_DIR}/tests/replicated_client.py" "$<TARGET_FILE_DIR:chunk_cli>")
         add_test(NAME worker_polling COMMAND "${Python3_EXECUTABLE}" -B
@@ -83,7 +116,7 @@ if(BUILD_TESTING)
                  "${CMAKE_CURRENT_SOURCE_DIR}/tests/traffic.py" "$<TARGET_FILE_DIR:chunk_cli>")
         add_test(NAME onebox COMMAND "${Python3_EXECUTABLE}" -B
                  "${CMAKE_CURRENT_SOURCE_DIR}/tests/onebox.py" "$<TARGET_FILE_DIR:chunk_cli>")
-        set_tests_properties(fmaster fmaster_commands replicated_client worker_polling chunk_repair
+        set_tests_properties(fmaster fmaster_commands space_integration replicated_client worker_polling chunk_repair
                              PROPERTIES LABELS "integration" TIMEOUT 120)
         set_tests_properties(chunk_trash traffic_integration
                              PROPERTIES LABELS "integration;slow" TIMEOUT 180)
@@ -94,3 +127,6 @@ endif()
 
 add_executable(chunk_bench EXCLUDE_FROM_ALL benchmarks/chunk_bench.cpp)
 target_link_libraries(chunk_bench PRIVATE chunk_client)
+
+add_executable(space_bench EXCLUDE_FROM_ALL benchmarks/space_bench.cpp)
+target_link_libraries(space_bench PRIVATE space_client)

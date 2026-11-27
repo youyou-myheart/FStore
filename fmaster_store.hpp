@@ -38,6 +38,15 @@ public:
     std::uint64_t remove_disk(const wire::RemoveDiskRequest& request);
     std::uint64_t apply_config(const wire::ApplyConfigRequest& request);
     void validate_config(const wire::ValidateConfigRequest& request, wire::ValidateConfigResponse& response) const;
+    void create_space(const wire::CreateSpaceRequest&, wire::SpaceResponse&);
+    void bind_pgs(const wire::BindPGsRequest&, wire::SpaceResponse&);
+    void unbind_pgs(const wire::BindPGsRequest&, wire::SpaceResponse&);
+    void list_pg_pool(const wire::ListPGPoolRequest&, wire::ListPGPoolResponse&) const;
+    void list_spaces(const wire::ListSpacesRequest&, wire::ListSpacesResponse&) const;
+    void list_pgs(const wire::ListPGsRequest&, wire::ListPGsResponse&) const;
+    void allocate_chunks(const wire::AllocateChunksRequest&, wire::AllocateChunksResponse&);
+    void allocate_blobs(const wire::AllocateBlobsRequest&, wire::AllocateBlobsResponse&);
+    void locate_chunk(const wire::LocateChunkRequest&, wire::LocateChunkResponse&) const;
     void record_heartbeat(const wire::HeartbeatReport& report);
     void record_probe_failure(const std::string& server_id, const std::string& endpoint,
                               std::uint64_t config_revision, const std::string& error);

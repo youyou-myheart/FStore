@@ -43,6 +43,15 @@ public:
     std::uint64_t remove_disk(const wire::RemoveDiskRequest& request) const;
     std::uint64_t apply_config(const wire::ApplyConfigRequest& request) const;
     wire::ValidateConfigResponse validate_config(const wire::ValidateConfigRequest& request) const;
+    wire::SpaceResponse create_space(const wire::CreateSpaceRequest& request) const;
+    wire::SpaceResponse bind_pgs(const wire::BindPGsRequest& request) const;
+    wire::SpaceResponse unbind_pgs(const wire::BindPGsRequest& request) const;
+    wire::ListPGPoolResponse list_pg_pool(const wire::ListPGPoolRequest& request) const;
+    wire::ListSpacesResponse list_spaces(const wire::ListSpacesRequest& request) const;
+    wire::ListPGsResponse list_pgs(const wire::ListPGsRequest& request) const;
+    wire::AllocateBlobsResponse allocate_blobs(const wire::AllocateBlobsRequest& request) const;
+    wire::AllocateChunksResponse allocate_chunks(const wire::AllocateChunksRequest& request) const;
+    wire::LocateChunkResponse locate_chunk(const wire::LocateChunkRequest& request) const;
     wire::ProbeNowResponse probe_now(const std::string& server_id = {}) const;
 
 private:

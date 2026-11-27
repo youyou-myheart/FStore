@@ -95,6 +95,25 @@ master=127.0.0.1:8090
 
 `watch` 周期性输出状态汇总。`--interval-ms` 设置正数毫秒间隔，`--count` 设置正数采样次数，省略次数时持续执行，可用 Ctrl+C 结束。JSON 模式每行输出一个完整汇总对象，便于逐行处理。
 
+## Space、PG 和 Chunk ID
+
+Space 使用独立的目录版本号，与节点配置版本分开。下列命令输出 JSON。`space-create`、`pg-bind` 和 `pg-unbind` 支持末尾 `--expected-revision=N`，版本来自 `spaces/space`。
+
+| 命令 | 用途 |
+|---|---|
+| `spaces` / `space NAME` | 列出 Space 或查询规格与绑定数量 |
+| `space-create NAME REPLICAS CHUNK_BYTES` | 创建不可变规格并自动绑定 200 个空闲全局 PG；放置参数为 `--placement=single-dc\|balanced-dc\|distinct-dc`、`--min-datacenters=N`、`--datacenters=DC1,DC2` |
+| `pg-bind NAME START COUNT` | 原子绑定指定全局 PG 区间，拒绝其他 Space 已占用的 PG |
+| `pg-unbind NAME START COUNT` | 释放尚未分配 Blob 的 Space 的指定绑定 |
+| `pg-pool [START=0 [LIMIT=100]]` | 查看全局 PG 所属 Space、空闲状态与总量 |
+| `pgs NAME [START=0 [LIMIT=100]]` | 按全局编号分页查看该 Space 绑定的 PG，最多 1,000 条，可加 `--include-inactive` |
+| `pg NAME PG_ID` | 查看一个 PG，未绑定时也可查询 |
+| `blob-allocate NAME [COUNT=1]` | 分配全局唯一的 48 位 Blob 序号及分散起点 `start_cursor`，最多 1,024 个 |
+| `allocate NAME SEQ_ID [CURSOR=auto [COUNT=1]]` | 省略游标或用 `auto` 自动分散起点；显式 uint64 游标用于重试和续分配，最多 1,024 个，返回 `next_cursor` |
+| `locate NAME CHUNK_ID` | 查询 ID 的副本路由 |
+
+FServer 的机房通过 `server-set ID ENDPOINT [enabled|disabled] --datacenter=NAME` 登记。已有放置引用的节点不能直接删除或改写地址、机房，启用/禁用仍可操作。完整策略和持久化语义见 [Space 与 PG](spaces.md)。
+
 ## 返回值
 
 命令成功时退出码为 0，参数错误、RPC 失败和 FMaster 业务错误时返回非零，错误说明写入标准错误。常见业务错误包括 `INVALID_ARGUMENT`、`NOT_FOUND`、`CONFLICT` 和 `STORAGE_ERROR`。
