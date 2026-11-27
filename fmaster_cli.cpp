@@ -45,6 +45,7 @@ constexpr std::string_view usage =
     "  disk-enable SERVER_ID DISK_ID | disk-disable SERVER_ID DISK_ID\n"
     "  disk-remove SERVER_ID DISK_ID\n"
     "  apply CONFIG_FILE\n"
+    "  recoveries [SPACE [AFTER_ID [LIMIT]]]  Recovery progress and failed-server timers\n"
     "  spaces | space NAME\n"
     "  space-create NAME REPLICAS CHUNK_BYTES\n"
     "       [--placement=single-dc|balanced-dc|distinct-dc] [--min-datacenters=N] [--datacenters=DC1,DC2]\n"
@@ -63,7 +64,7 @@ enum class Command {
     List, Status, Servers, Server, Disks, Disk, Capacity, Errors, Config, Validate,
     Probe, Watch, ServerSet, ServerEnable, ServerDisable, ServerRemove,
     DiskSet, DiskEnable, DiskDisable, DiskRemove, Apply,
-    Spaces, Space, SpaceCreate, PGBind, PGUnbind, PGPool, PGs, PG, BlobAllocate, Allocate, Locate
+    Recoveries, Spaces, Space, SpaceCreate, PGBind, PGUnbind, PGPool, PGs, PG, BlobAllocate, Allocate, Locate
 };
 enum Option : unsigned { Json = 1, Revision = 2, Online = 4, Enabled = 8, Health = 16, Watch = 32,
                          Location = 64, SpacePolicy = 128, Inactive = 256 };
@@ -96,6 +97,7 @@ constexpr std::array specifications{
     Specification{"disk-disable", Command::DiskDisable, 2, 2, Revision},
     Specification{"disk-remove", Command::DiskRemove, 2, 2, Revision},
     Specification{"apply", Command::Apply, 1, 1, Revision},
+    Specification{"recoveries", Command::Recoveries, 0, 3, Json},
     Specification{"spaces", Command::Spaces, 0, 0, Json},
     Specification{"space", Command::Space, 1, 1, Json},
     Specification{"space-create", Command::SpaceCreate, 3, 3, Revision | SpacePolicy | Json},
@@ -548,6 +550,13 @@ std::uint64_t mutate(const master::Client& client, const Arguments& args) {
 void execute(const master::Client& client, const Arguments& args) {
     const auto command = args.specification.command;
     const auto& p = args.parameters;
+    if (command == Command::Recoveries) {
+        wire::ListRecoveriesRequest request;
+        if (!p.empty()) request.set_space_name(p[0]);
+        if (p.size() >= 2) request.set_after_id(number(p[1], "recovery ID"));
+        if (p.size() >= 3) request.set_limit(number32(p[2]));
+        json(client.list_recoveries(request)); return;
+    }
     if (command == Command::SpaceCreate) {
         wire::CreateSpaceRequest request;
         request.set_name(p[0]);

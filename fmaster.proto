@@ -61,6 +61,9 @@ message ServerStatus {
   repeated DiskReport disks = 4;
   uint64 last_probe_unix_ms = 5;
   string error = 6;
+  uint64 failure_since_unix_ms = 7;
+  bool pg_recovery_capable = 8;
+  uint64 chunk_count = 9;
 }
 
 message ListRequest {
@@ -152,11 +155,15 @@ message HeartbeatReport {
   repeated DiskReport disks = 3;
   // The reporting process's advertised chunk service address.
   string endpoint = 4;
+  bool pg_recovery_capable = 5;
+  uint64 chunk_count = 6;
 }
 
+message RetiredPG { uint32 pg_id = 1; uint64 epoch = 2; }
 message ServerHeartbeatRequest {
   FServer server = 1;
   uint64 config_revision = 2;
+  repeated RetiredPG retired_pgs = 3;
 }
 
 message ServerHeartbeatResponse {
@@ -169,6 +176,7 @@ service FServerStatusService {
 }
 
 service FMasterService {
+  rpc ListRecoveries(ListRecoveriesRequest) returns (ListRecoveriesResponse);
   rpc List(ListRequest) returns (ListResponse);
   rpc SetServer(SetServerRequest) returns (MutationResponse);
   rpc SetDisk(SetDiskRequest) returns (MutationResponse);
@@ -223,6 +231,8 @@ message PlacementGroup {
   uint32 id = 1;
   bool active = 2;
   repeated ReplicaTarget replicas = 3;
+  bool recovering = 4;
+  uint64 epoch = 5;
 }
 message ChunkRoute {
   string chunk_id = 1; // 30 hex digits: seq_id:48 | space_id:8 | index:64.
@@ -313,6 +323,7 @@ message SpaceState {
   uint64 reserved_sequence = 2; // Version 1 only; never reinterpret old Chunk IDs.
   repeated PGRange ranges = 3;
   repeated BlobSequenceRange blob_sequences = 4;
+  repeated PlacementGroup overrides = 5;
 }
 message BlobSequenceRange { uint64 begin = 1; uint64 end = 2; } // Inclusive, durable reservations.
 message SpaceCatalog {
@@ -320,4 +331,23 @@ message SpaceCatalog {
   uint64 next_space_id = 2;
   repeated SpaceState spaces = 3;
   uint64 reserved_blob_sequence = 4; // Globally unique Blob sequences across Spaces.
+  repeated ServerFailure failures = 5;
+  repeated PGRecovery recoveries = 6;
+  uint64 recovery_sequence = 7;
+}
+
+message ServerFailure { string server_id = 1; uint64 since_unix_ms = 2; }
+enum RecoveryPhase { PREPARING = 0; SEALING = 1; COPYING = 2; VERIFYING = 3; ACTIVATING = 4; RECOVERED = 5; }
+message PGRecovery {
+  uint64 id = 1; string space_name = 2; uint32 pg_id = 3;
+  PlacementGroup old_pg = 4; PlacementGroup new_pg = 5;
+  repeated string failed_servers = 6;
+  RecoveryPhase phase = 7; string cursor = 8; string error = 9;
+  uint64 copied_chunks = 10; uint64 copied_bytes = 11;
+  uint64 updated_unix_ms = 12;
+}
+message ListRecoveriesRequest { string space_name = 1; uint64 after_id = 2; uint32 limit = 3; bool active_only = 4; }
+message ListRecoveriesResponse {
+  Status status = 1; uint64 revision = 2; repeated PGRecovery recoveries = 3;
+  repeated ServerFailure failures = 4; optional uint64 next_id = 5;
 }

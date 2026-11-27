@@ -20,7 +20,10 @@ enum Code {
   REPAIR_FAILED = 13;
   RESTORE_CONFLICT = 14;
   LENGTH_MISMATCH = 15;
+  SEALED = 16;
 }
+
+enum CloseReason { NOT_CLOSED = 0; USER_FREEZE = 1; PG_REPAIR = 2; }
 
 message Status {
   Code code = 1;
@@ -29,17 +32,20 @@ message Status {
 
 message ChunkRequest {
   string chunk_id = 1;
+  uint64 pg_epoch = 15;
 }
 
 message CreateRequest {
   string chunk_id = 1;
   uint64 capacity = 2;
+  uint64 pg_epoch = 15;
 }
 
 message CreateResponse {
   Status status = 1;
-  bool frozen = 2;
+  bool frozen = 2; // Legacy immutable flag, true for both USER_FREEZE and PG_REPAIR.
   uint64 capacity = 3;
+  optional CloseReason close_reason = 4;
 }
 
 // Append payload is carried in the bRPC request attachment.
@@ -48,6 +54,7 @@ message AppendRequest {
   uint64 length = 2;
   optional uint64 offset = 3;
   optional uint32 wait_timeout_ms = 4;
+  uint64 pg_epoch = 15;
 }
 
 message AppendResponse {
@@ -60,12 +67,14 @@ message ReadRequest {
   string chunk_id = 1;
   uint64 offset = 2;
   uint64 length = 3;
+  uint64 pg_epoch = 15;
 }
 
 // Read payload is carried in the bRPC response attachment.
 message ReadResponse {
   Status status = 1;
-  optional bool frozen = 2;
+  optional bool frozen = 2; // Legacy immutable flag; use close_reason to distinguish causes.
+  optional CloseReason close_reason = 3;
 }
 
 message DeleteResponse {
@@ -76,21 +85,25 @@ message DeleteResponse {
 message RestoreRequest {
   string chunk_id = 1;
   uint64 deleted_at_ns = 2;
+  uint64 pg_epoch = 15;
 }
 
 message RestoreResponse {
   Status status = 1;
   bool frozen = 2;
+  optional CloseReason close_reason = 3;
 }
 
 message FreezeResponse {
   Status status = 1;
   uint64 length = 2;
 }
+message SealResponse { Status status = 1; uint64 length = 2; }
 
 message FreezeAtLengthRequest {
   string chunk_id = 1;
   uint64 expected_length = 2;
+  uint64 pg_epoch = 15;
 }
 
 enum CopyPriority {
@@ -103,6 +116,8 @@ message RepairRequest {
   string chunk_id = 1;
   string destination = 2;
   CopyPriority priority = 3;
+  uint64 pg_epoch = 15;
+  uint64 recovery_token = 16;
 }
 
 message RepairResponse {
@@ -121,6 +136,9 @@ message RepairBlock {
   fixed32 crc32c = 7;
   bool abort = 8;
   CopyPriority priority = 9;
+  optional CloseReason close_reason = 10;
+  uint64 pg_epoch = 15;
+  uint64 recovery_token = 16;
 }
 
 message TrafficStatsRequest {}
@@ -138,6 +156,13 @@ message TrafficStatsResponse {
 }
 
 service ChunkService {
+  rpc ListLocalPGs(ListLocalPGsRequest) returns (ListLocalPGsResponse);
+  rpc GetPGInventory(PGInventoryRequest) returns (PGInventoryResponse);
+  rpc SetPGFence(PGFenceRequest) returns (PGFenceResponse);
+  rpc FencePG(PGFenceRequest) returns (PGFenceResponse);
+  rpc RepairPG(RepairPGRequest) returns (RepairPGResponse);
+  rpc SealPG(SealPGRequest) returns (PGInventoryResponse);
+  rpc SealChunk(SealChunkRequest) returns (SealResponse);
   rpc GetTrafficStats(TrafficStatsRequest) returns (TrafficStatsResponse);
   rpc RepairChunk(RepairRequest) returns (RepairResponse);
   rpc ReceiveRepairBlock(RepairBlock) returns (RepairResponse);
@@ -149,3 +174,37 @@ service ChunkService {
   rpc FreezeChunk(ChunkRequest) returns (FreezeResponse);
   rpc FreezeChunkAtLength(FreezeAtLengthRequest) returns (FreezeResponse);
 }
+
+// Durable recovery fences and paginated PG inventory. A Source fence blocks
+// namespace mutations and appends. Recovery seals chunks before copying.
+enum PGFenceMode { PG_ACTIVE = 0; PG_SOURCE = 1; PG_TARGET = 2; PG_RETIRED = 3; }
+message PGInventoryRequest { uint32 pg_id = 1; string after_chunk = 2; uint32 limit = 3; }
+message PGChunkEntry {
+  string chunk_id = 1; bool frozen = 2;
+  uint64 length = 3; uint64 capacity = 4; uint32 crc32c = 5; // SealPG inspection only.
+  optional CloseReason close_reason = 6;
+}
+// Internal repair operation: requires a matching SOURCE PG fence and nonzero token.
+message SealChunkRequest {
+  string chunk_id = 1; optional uint64 expected_length = 2;
+  uint64 recovery_token = 16;
+}
+message SealPGRequest {
+  uint32 pg_id = 1; uint64 recovery_token = 2; string after_chunk = 3;
+  uint32 limit = 4; bool inspect_only = 5;
+}
+message PGInventoryResponse {
+  Status status = 1; repeated PGChunkEntry chunks = 2; optional string next_chunk = 3;
+  uint64 chunk_count = 4; uint64 open_count = 5; uint64 generation = 6;
+  uint64 recovery_token = 7; uint64 pg_epoch = 8; PGFenceMode mode = 9;
+}
+message PGFenceRequest { uint32 pg_id = 1; uint64 recovery_token = 2; uint64 expected_epoch = 3; PGFenceMode mode = 4; }
+message PGFenceResponse { Status status = 1; }
+message RepairPGRequest {
+  uint32 pg_id = 1; uint64 recovery_token = 2; string destination = 3;
+  string after_chunk = 4; uint32 limit = 5; CopyPriority priority = 6;
+}
+message RepairPGResponse { Status status = 1; optional string next_chunk = 2; uint64 copied_chunks = 3; uint64 copied_bytes = 4; }
+message ListLocalPGsRequest { uint32 start = 1; uint32 limit = 2; }
+message LocalPG { uint32 pg_id = 1; uint64 chunk_count = 2; uint64 open_count = 3; }
+message ListLocalPGsResponse { Status status = 1; repeated LocalPG pgs = 2; optional uint32 next_start = 3; }

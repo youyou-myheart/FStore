@@ -1,5 +1,6 @@
 #include "fmaster_store.hpp"
 #include "fmaster_monitor.hpp"
+#include "fmaster_recovery.hpp"
 
 #include <brpc/closure_guard.h>
 #include <brpc/server.h>
@@ -96,6 +97,11 @@ public:
         });
     }
 
+    void ListRecoveries(google::protobuf::RpcController*, const wire::ListRecoveriesRequest* request,
+                        wire::ListRecoveriesResponse* response, google::protobuf::Closure* done) override {
+        complete(done, response, [&] { store_.list_recoveries(*request, *response); });
+    }
+
     void CreateSpace(google::protobuf::RpcController*, const wire::CreateSpaceRequest* request,
                     wire::SpaceResponse* response, google::protobuf::Closure* done) override {
         complete(done, response, [&] { store_.create_space(*request, *response); });
@@ -151,6 +157,7 @@ struct Options {
     std::chrono::milliseconds timeout{10000};
     std::chrono::milliseconds interval{2000};
     std::chrono::milliseconds probe_timeout{1000};
+    std::chrono::milliseconds recovery_grace{600000}, recovery_interval{1000}, recovery_timeout{300000};
 };
 
 std::chrono::milliseconds duration(std::string_view value) {
@@ -179,6 +186,9 @@ Options parse(int argc, char** argv) {
         else if (name == "--listen") options.endpoint = value;
         else if (name == "--heartbeat-timeout-ms") options.timeout = duration(value);
         else if (name == "--heartbeat-interval-ms") options.interval = duration(value);
+        else if (name == "--recovery-grace-ms") options.recovery_grace = duration(value);
+        else if (name == "--recovery-interval-ms") options.recovery_interval = duration(value);
+        else if (name == "--recovery-rpc-timeout-ms") options.recovery_timeout = duration(value);
         else if (name == "--probe-timeout-ms") options.probe_timeout = duration(value);
         else throw std::invalid_argument("unknown option " + std::string(name));
     }
@@ -195,6 +205,7 @@ int main(int argc, char** argv) {
         const auto config = parse(argc, argv);
         master::Store store(config.directory, config.config, config.timeout, config.interval);
         master::Monitor monitor(store, config.interval, config.probe_timeout);
+        master::RecoveryMonitor recovery(store, config.recovery_grace, config.recovery_interval, config.recovery_timeout);
         Service service(store, monitor);
         brpc::Server server;
         if (server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) return EXIT_FAILURE;
@@ -207,7 +218,7 @@ int main(int argc, char** argv) {
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n'
                   << "usage: fmaster --data-dir=DIR [--listen=HOST:PORT] [--config=FILE]"
-                     " [--heartbeat-timeout-ms=10000] [--heartbeat-interval-ms=2000] [--probe-timeout-ms=1000]\n";
+                     " [--heartbeat-timeout-ms=10000] [--heartbeat-interval-ms=2000] [--probe-timeout-ms=1000] [--recovery-grace-ms=600000] [--recovery-interval-ms=1000] [--recovery-rpc-timeout-ms=300000]\n";
         return EXIT_FAILURE;
     }
 }

@@ -151,6 +151,14 @@ wire::SpaceResponse Client::unbind_pgs(const wire::BindPGsRequest& request) cons
     return response;
 }
 
+wire::ListRecoveriesResponse Client::list_recoveries(const wire::ListRecoveriesRequest& request) const {
+    wire::ListRecoveriesResponse response;
+    brpc::Controller controller;
+    impl_->stub.ListRecoveries(&controller, &request, &response, nullptr);
+    check_response(controller, response);
+    return response;
+}
+
 wire::ListPGPoolResponse Client::list_pg_pool(const wire::ListPGPoolRequest& request) const {
     wire::ListPGPoolResponse response;
     brpc::Controller controller;

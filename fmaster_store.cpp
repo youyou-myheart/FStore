@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <limits>
 #include <mutex>
+#include <map>
 #include <optional>
 #include <set>
 #include <string_view>
@@ -259,22 +260,22 @@ struct Store::Impl {
         const auto spaces = read_file(root / "spaces.pb", max_config_bytes + 16, true);
         if (spaces) {
             const auto& bytes = *spaces;
-            if (bytes.size() < 16 || (bytes.substr(0, 8) != "FSPACE01" && bytes.substr(0, 8) != "FSPACE02" && bytes.substr(0, 8) != "FSPACE03") ||
+            if (bytes.size() < 16 || (bytes.substr(0, 8) != "FSPACE01" && bytes.substr(0, 8) != "FSPACE02" &&
+                                     bytes.substr(0, 8) != "FSPACE03" && bytes.substr(0, 8) != "FSPACE04") ||
                 read_u32(std::string_view(bytes).substr(8, 4)) != bytes.size() - 16 ||
                 read_u32(std::string_view(bytes).substr(12, 4)) != butil::crc32c::Value(bytes.data() + 16, bytes.size() - 16) ||
                 !catalog.ParseFromArray(bytes.data() + 16, static_cast<int>(bytes.size() - 16))) {
                 throw Error(wire::STORAGE_ERROR, "invalid space catalog snapshot");
             }
-            if (bytes.substr(0, 8) != "FSPACE03") {
+            if (bytes.substr(0, 8) == "FSPACE01" || bytes.substr(0, 8) == "FSPACE02") {
                 if (!catalog.spaces().empty() || catalog.reserved_blob_sequence()) {
                     throw Error(wire::STORAGE_ERROR, "legacy Space/PG and Chunk ID layouts require explicit migration");
                 }
                 catalog.set_next_space_id(0);
-                placement::validate_catalog(catalog);
-                persist_catalog(catalog);
             }
             placement::validate_catalog(catalog);
             placement::validate_topology(catalog, topology);
+            if (bytes.substr(0, 8) != "FSPACE04") persist_catalog(catalog);
             File snapshot(::open((root / "spaces.pb").c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
             sync_file(snapshot.fd);
             sync_file(directory_file->fd);
@@ -380,7 +381,8 @@ struct Store::Impl {
     void persist_catalog(const wire::SpaceCatalog& candidate) {
         const auto payload = candidate.SerializeAsString();
         if (payload.size() > max_config_bytes) throw Error(wire::INVALID_ARGUMENT, "space catalog exceeds 16 MiB");
-        std::string bytes = "FSPACE03";
+        // Older masters must reject recovery routes instead of silently ignoring them.
+        std::string bytes = "FSPACE04";
         append_u32(bytes, static_cast<std::uint32_t>(payload.size()));
         append_u32(bytes, butil::crc32c::Value(payload.data(), payload.size()));
         bytes += payload;
@@ -536,6 +538,8 @@ struct Store::Impl {
     std::unordered_map<std::string, LiveServer> live_servers;
     std::unordered_map<std::string, std::uint64_t> changed_revisions;
     bool storage_failed = false;
+    std::size_t recovery_scan_space = 0;
+    std::uint32_t recovery_scan_pg = 0;
 };
 
 Store::Store(const fs::path& directory, const fs::path& bootstrap,
@@ -756,6 +760,9 @@ void Store::unbind_pgs(const wire::BindPGsRequest& request, wire::SpaceResponse&
     }
     if (changed) {
         if (!old.blob_sequences().empty()) throw Error(wire::CONFLICT, "Space has issued Blob sequences; unbinding requires data migration");
+        for (const auto& pg : old.overrides()) if (pg.id() >= request.start() && pg.id() < end) {
+            throw Error(wire::CONFLICT, "PG has durable recovery history; unbinding requires epoch migration");
+        }
         Impl::compact_ranges(updated);
         auto candidate = impl_->catalog;
         for (auto& state : *candidate.mutable_spaces()) {
@@ -900,6 +907,7 @@ void Store::allocate_chunks(const wire::AllocateChunksRequest& request, wire::Al
         auto [route, inserted] = routes.try_emplace(pg);
         if (inserted) {
             route->second = placement::group(state, pg);
+            if (route->second.recovering()) throw Error(wire::CONFLICT, "PG recovery in progress");
             for (const auto& replica : route->second.replicas()) {
                 if (!eligible.at(replica.server_id())) {
                     throw Error(wire::CONFLICT, "PG replica is unavailable or administratively disabled: " + replica.server_id());
@@ -929,6 +937,158 @@ void Store::locate_chunk(const wire::LocateChunkRequest& request, wire::LocateCh
     *chunk->mutable_pg() = placement::group(state, id.pg);
 }
 
+namespace {
+void set_override(wire::SpaceState& state, const wire::PlacementGroup& pg) {
+    auto* values = state.mutable_overrides();
+    for (auto& value : *values) if (value.id() == pg.id()) { value = pg; return; }
+    *values->Add() = pg;
+    std::sort(values->begin(), values->end(), [](const auto& a, const auto& b) { return a.id() < b.id(); });
+}
+bool contains_replica(const wire::PlacementGroup& pg, const std::string& id) {
+    return std::any_of(pg.replicas().begin(), pg.replicas().end(), [&](const auto& node) { return node.server_id() == id; });
+}
+}
+
+void Store::list_recoveries(const wire::ListRecoveriesRequest& request, wire::ListRecoveriesResponse& response) const {
+    std::lock_guard lock(impl_->mutex); impl_->ensure_available();
+    const auto limit = request.limit() ? request.limit() : 100;
+    if (limit > 1000) throw Error(wire::INVALID_ARGUMENT, "recovery page exceeds 1000");
+    response.Clear(); response.mutable_status(); response.set_revision(impl_->catalog.revision());
+    *response.mutable_failures() = impl_->catalog.failures();
+    for (const auto& job : impl_->catalog.recoveries()) {
+        if (job.id() <= request.after_id() || (!request.space_name().empty() && request.space_name() != job.space_name()) ||
+            (request.active_only() && job.phase() == wire::RECOVERED)) continue;
+        if (response.recoveries_size() == static_cast<int>(limit)) { response.set_next_id(response.recoveries(response.recoveries_size() - 1).id()); break; }
+        *response.add_recoveries() = job;
+    }
+}
+
+void Store::retirement_directives(const std::string& server, wire::ServerHeartbeatRequest& request) const {
+    std::lock_guard lock(impl_->mutex); impl_->ensure_available();
+    std::map<std::uint32_t, std::uint64_t> retired;
+    for (const auto& job : impl_->catalog.recoveries()) {
+        if (job.phase() == wire::RECOVERED && contains_replica(job.old_pg(), server) && !contains_replica(job.new_pg(), server)) retired[job.pg_id()] = job.id();
+    }
+    for (const auto& [pg, epoch] : retired) { auto* item = request.add_retired_pgs(); item->set_pg_id(pg); item->set_epoch(epoch); }
+}
+
+void Store::plan_recoveries(std::uint64_t now, std::uint64_t grace, std::uint32_t scan_limit) {
+    if (!grace || !scan_limit || scan_limit > 4096) throw Error(wire::INVALID_ARGUMENT, "invalid recovery scheduler limits");
+    std::lock_guard lock(impl_->mutex); impl_->ensure_available();
+    if (impl_->catalog.spaces().empty() || impl_->catalog.failures().empty()) return;
+    std::set<std::string> failed;
+    for (const auto& failure : impl_->catalog.failures()) {
+        const auto configured = find_server(impl_->topology, failure.server_id());
+        const auto live = impl_->live_servers.find(failure.server_id());
+        if (configured != impl_->topology.mutable_servers()->end() && !configured->disabled() &&
+            live != impl_->live_servers.end() && !live->second.status.error().empty() &&
+            now >= failure.since_unix_ms() && now - failure.since_unix_ms() >= grace) failed.insert(failure.server_id());
+    }
+    if (failed.empty()) return;
+    unsigned active = 0;
+    for (const auto& job : impl_->catalog.recoveries()) if (job.phase() != wire::RECOVERED) ++active;
+    unsigned empty_spaces = 0;
+    for (unsigned inspected = 0; inspected < scan_limit && active < 16;) {
+        impl_->recovery_scan_space %= impl_->catalog.spaces_size();
+        const auto space_index = impl_->recovery_scan_space;
+        const auto& state = impl_->catalog.spaces(static_cast<int>(space_index));
+        const auto next = placement::next_cursor(state, impl_->recovery_scan_pg);
+        if (!next || *next >= placement::pg_count) {
+            ++impl_->recovery_scan_space; impl_->recovery_scan_pg = 0;
+            if (++empty_spaces >= static_cast<unsigned>(impl_->catalog.spaces_size())) break;
+            continue;
+        }
+        empty_spaces = 0; ++inspected;
+        const auto pg_id = static_cast<std::uint32_t>(*next); impl_->recovery_scan_pg = pg_id + 1;
+        const auto old = placement::group(state, pg_id);
+        if (old.recovering()) continue;
+        std::vector<unsigned> missing;
+        bool survivors_healthy = true;
+        for (int i = 0; i < old.replicas_size(); ++i) {
+            const auto& node = old.replicas(i);
+            if (failed.contains(node.server_id())) { missing.push_back(i); continue; }
+            const auto configured = find_server(impl_->topology, node.server_id());
+            const auto live = impl_->live_servers.find(node.server_id());
+            if (configured == impl_->topology.mutable_servers()->end() || !impl_->eligible(*configured) ||
+                live == impl_->live_servers.end() || !live->second.status.pg_recovery_capable()) survivors_healthy = false;
+        }
+        if (missing.empty() || missing.size() == static_cast<std::size_t>(old.replicas_size()) || !survivors_healthy) continue;
+        wire::PlacementGroup replacement = old;
+        bool found_all = true;
+        for (const auto slot : missing) {
+            const wire::FServer* best = nullptr;
+            std::uint64_t best_load = UINT64_MAX;
+            for (const auto& target : impl_->topology.servers()) {
+                if (contains_replica(old, target.id()) || contains_replica(replacement, target.id()) || !impl_->eligible(target)) continue;
+                const auto& live = impl_->live_servers.at(target.id()).status;
+                if (!live.pg_recovery_capable()) continue;
+                const auto& allowed = state.space().spec().placement_policy().datacenters();
+                if (!allowed.empty() && std::find(allowed.begin(), allowed.end(), target.datacenter()) == allowed.end()) continue;
+                bool capacity = false;
+                for (const auto& disk : target.disks()) if (!disk.disabled()) for (const auto& report : live.disks()) {
+                    if (report.id() == disk.id() && report.healthy() && report.available_bytes() >= state.space().spec().chunk_size()) capacity = true;
+                }
+                if (!capacity) continue;
+                auto proposed = replacement;
+                auto* node = proposed.mutable_replicas(slot); node->set_server_id(target.id()); node->set_endpoint(target.endpoint()); node->set_datacenter(target.datacenter());
+                wire::SpaceState check; *check.mutable_space() = state.space();
+                auto* range = check.add_ranges(); range->set_begin(pg_id); range->set_end(pg_id + 1); range->set_algorithm_version(1);
+                *range->mutable_candidates() = proposed.replicas();
+                try { placement::group(check, pg_id); } catch (const Error&) { continue; }
+                std::uint64_t load = 0;
+                for (const auto& job : impl_->catalog.recoveries()) if (contains_replica(job.new_pg(), target.id()) && !contains_replica(job.old_pg(), target.id())) ++load;
+                if (!best || load < best_load || (load == best_load && target.id() < best->id())) { best = &target; best_load = load; }
+            }
+            if (!best) { found_all = false; break; }
+            auto* node = replacement.mutable_replicas(slot); node->set_server_id(best->id()); node->set_endpoint(best->endpoint()); node->set_datacenter(best->datacenter());
+        }
+        if (!found_all) continue;
+        if (impl_->catalog.recovery_sequence() == UINT64_MAX) throw Error(wire::CONFLICT, "recovery epochs exhausted");
+        auto candidate = impl_->catalog;
+        const auto id = candidate.recovery_sequence() + 1; candidate.set_recovery_sequence(id);
+        auto* job = candidate.add_recoveries(); job->set_id(id); job->set_space_name(state.space().name()); job->set_pg_id(pg_id);
+        *job->mutable_old_pg() = old; replacement.set_epoch(id); replacement.set_recovering(false); *job->mutable_new_pg() = replacement;
+        for (const auto slot : missing) job->add_failed_servers(old.replicas(slot).server_id());
+        job->set_updated_unix_ms(now);
+        auto blocked = old; blocked.set_recovering(true);
+        set_override(*candidate.mutable_spaces(static_cast<int>(space_index)), blocked);
+        impl_->publish_catalog(candidate); ++active;
+    }
+}
+
+void Store::advance_recovery(std::uint64_t id, wire::RecoveryPhase expected, wire::RecoveryPhase next,
+                             const std::string& cursor, std::uint64_t chunks, std::uint64_t bytes) {
+    std::lock_guard lock(impl_->mutex); impl_->ensure_available();
+    auto candidate = impl_->catalog;
+    auto found = std::find_if(candidate.mutable_recoveries()->begin(), candidate.mutable_recoveries()->end(), [&](const auto& job) { return job.id() == id; });
+    if (found == candidate.mutable_recoveries()->end()) throw Error(wire::NOT_FOUND, "recovery not found");
+    if (found->phase() != expected) throw Error(wire::CONFLICT, "recovery phase changed");
+    if (next < expected || next > expected + 1 || expected == wire::RECOVERED ||
+        (next == expected && expected != wire::SEALING && expected != wire::COPYING && expected != wire::VERIFYING)) throw Error(wire::INVALID_ARGUMENT, "invalid recovery transition");
+    if ((next == expected && cursor.empty()) || (next != expected && !cursor.empty())) throw Error(wire::INVALID_ARGUMENT, "cursor must advance within a phase and reset between phases");
+    if (!cursor.empty() && (cursor.size() != 30 || !valid_storage_chunk_id(cursor) || ChunkId::parse(cursor).pg() != found->pg_id() ||
+                           (next == expected && cursor <= found->cursor()))) throw Error(wire::INVALID_ARGUMENT, "invalid recovery progress cursor");
+    if (chunks > UINT64_MAX - found->copied_chunks() || bytes > UINT64_MAX - found->copied_bytes()) throw Error(wire::INVALID_ARGUMENT, "recovery counters overflow");
+    found->set_phase(next); found->set_cursor(cursor); found->clear_error(); found->set_updated_unix_ms(wall_milliseconds());
+    found->set_copied_chunks(found->copied_chunks() + chunks); found->set_copied_bytes(found->copied_bytes() + bytes);
+    if (next == wire::RECOVERED) {
+        for (auto& state : *candidate.mutable_spaces()) if (state.space().name() == found->space_name()) set_override(state, found->new_pg());
+        impl_->publish_catalog(candidate);
+    } else { impl_->persist_catalog(candidate); impl_->catalog.Swap(&candidate); }
+}
+
+void Store::recovery_error(std::uint64_t id, const std::string& error) {
+    std::lock_guard lock(impl_->mutex); impl_->ensure_available();
+    auto candidate = impl_->catalog;
+    for (auto& job : *candidate.mutable_recoveries()) {
+        if (job.id() != id || job.phase() == wire::RECOVERED) continue;
+        const auto message = error.substr(0, 4096);
+        if (job.error() == message) return;
+        job.set_error(message); job.set_updated_unix_ms(wall_milliseconds());
+        impl_->persist_catalog(candidate); impl_->catalog.Swap(&candidate); return;
+    }
+}
+
 void Store::record_heartbeat(const wire::HeartbeatReport& request) {
     std::lock_guard lock(impl_->mutex);
     auto& server = impl_->checked_probe(request.server_id(), request.endpoint(), request.config_revision());
@@ -952,6 +1112,16 @@ void Store::record_heartbeat(const wire::HeartbeatReport& request) {
         observed->set_observed_unix_ms(observed_at);
         if (report.healthy()) observed->clear_error();
     }
+    if (std::any_of(impl_->catalog.failures().begin(), impl_->catalog.failures().end(), [&](const auto& f) { return f.server_id() == server.id(); })) {
+        auto candidate = impl_->catalog;
+        auto* failures = candidate.mutable_failures();
+        for (auto it = failures->begin(); it != failures->end();) {
+            if (it->server_id() == server.id()) it = failures->erase(it); else ++it;
+        }
+        impl_->persist_catalog(candidate); impl_->catalog.Swap(&candidate);
+    }
+    next.status.set_pg_recovery_capable(request.pg_recovery_capable());
+    next.status.set_chunk_count(request.chunk_count());
     next.seen = Clock::now();
     next.status.set_server_id(server.id());
     next.status.set_online(true);
@@ -968,7 +1138,15 @@ void Store::record_probe_failure(const std::string& server_id, const std::string
     const auto existing = impl_->live_servers.find(server_id);
     if (existing != impl_->live_servers.end()) next = existing->second;
     next.status.set_server_id(server_id);
-    next.status.set_last_probe_unix_ms(wall_milliseconds());
+    const auto now = wall_milliseconds();
+    auto failure = std::find_if(impl_->catalog.failures().begin(), impl_->catalog.failures().end(), [&](const auto& f) { return f.server_id() == server_id; });
+    std::uint64_t since = now;
+    if (failure == impl_->catalog.failures().end()) {
+        auto candidate = impl_->catalog; auto* item = candidate.add_failures(); item->set_server_id(server_id); item->set_since_unix_ms(now);
+        impl_->persist_catalog(candidate); impl_->catalog.Swap(&candidate);
+    } else since = failure->since_unix_ms();
+    next.status.set_failure_since_unix_ms(since);
+    next.status.set_last_probe_unix_ms(now);
     next.status.set_error(error.empty() ? "FServer probe failed" : error.substr(0, 4096));
     impl_->live_servers.insert_or_assign(server_id, std::move(next));
 }

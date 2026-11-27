@@ -148,7 +148,7 @@ SDK 会先校验整批回复的 ID、游标、Space ID 与规格一致性，再�
 
 ## 持久化、兼容性和验证
 
-`spaces.pb` 的 `FSPACE03` 格式保存 Space 规格、全局 PG 独占绑定、候选节点集合和 Blob 序号预留段，带 CRC32C 校验，采用临时文件写入、文件 fsync、rename、目录 fsync。`topology.pb` 继续保存节点与盘，备份应同时保留两者。元数据持久化失败后拒绝后续服务，损坏快照拒绝启动。
+`spaces.pb` 的 `FSPACE04` 格式保存 Space 规格、全局 PG 独占绑定、候选节点集合、Blob 序号预留段，以及 PG 恢复状态和路由覆盖，带 CRC32C 校验，采用临时文件写入、文件 fsync、rename、目录 fsync。现有 `FSPACE03` 快照校验通过后自动升级，旧 FMaster 会拒绝新格式，避免忽略恢复后的路由。`topology.pb` 继续保存节点与盘，备份应同时保留两者。元数据持久化失败后拒绝后续服务，损坏快照拒绝启动。
 
 Space 目录有独立 revision。创建、绑定、解绑支持末尾 `--expected-revision=N`，从 `spaces/space/pg-pool` 查询该版本。序号段预留不改变配置版本。
 

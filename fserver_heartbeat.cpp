@@ -1,4 +1,5 @@
 #include "fserver_heartbeat.hpp"
+#include "chunk_store.hpp"
 
 #include <brpc/closure_guard.h>
 #include <butil/endpoint.h>
@@ -87,8 +88,8 @@ void probe_disk(const wire::Disk& disk, wire::DiskReport& report) {
 }
 }
 
-FServerStatusService::FServerStatusService(const std::string& server_id, const std::string& endpoint)
-    : server_id_(server_id), endpoint_(advertised_endpoint(endpoint)) {
+FServerStatusService::FServerStatusService(const std::string& server_id, const std::string& endpoint, ChunkStore* store)
+    : store_(store), server_id_(server_id), endpoint_(advertised_endpoint(endpoint)) {
     validate_id(server_id_);
 }
 
@@ -110,7 +111,11 @@ void FServerStatusService::Heartbeat(google::protobuf::RpcController*,
             return;
         }
         validate_disks(request->server());
+        if (store_) {
+            for (const auto& pg : request->retired_pgs()) store_->inventory().fence(pg.pg_id(), pg.epoch(), pg.epoch(), PGMode::Retired);
+        }
         wire::HeartbeatReport report;
+        if (store_) { report.set_chunk_count(store_->inventory().chunk_count()); report.set_pg_recovery_capable(true); }
         report.set_server_id(server_id_);
         report.set_endpoint(endpoint_);
         report.set_config_revision(request->config_revision());

@@ -26,13 +26,14 @@ void check_success(const ReplicaReadResult& reply, const std::string& endpoint,
     check(reply.endpoint == endpoint, "replica results reordered");
     check(!reply.error, "unexpected replica error");
     check(reply.frozen.has_value() && *reply.frozen == (node == 0), "wrong frozen state");
+    check(reply.state == (node == 0 ? State::Frozen : State::Open), "wrong detailed state");
     check(reply.data.equals(contents(node, length)), "wrong replica bytes");
 }
 
 template<class Error>
 void check_error(const ReplicaReadResult& reply) {
     check(bool(reply.error), "expected a per-replica error");
-    check(reply.data.empty() && !reply.frozen.has_value(), "failed read exposed data or state");
+    check(reply.data.empty() && !reply.frozen.has_value() && !reply.state, "failed read exposed data or state");
     try {
         std::rethrow_exception(reply.error);
     } catch (const Error&) {

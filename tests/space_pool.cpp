@@ -4,6 +4,7 @@
 #include <brpc/server.h>
 #include <butil/endpoint.h>
 #include <barrier>
+#include <atomic>
 #include <future>
 #include <iostream>
 
@@ -15,6 +16,9 @@ void check(bool value, const char* message) { if (!value) throw std::runtime_err
 // Controlled route cardinality tests cache eviction without launching hundreds
 // of storage processes. No data I/O is issued to these endpoint fixtures.
 class Routes final : public wire::FMasterService {
+public:
+    std::atomic<std::uint64_t> epoch{0};
+private:
     void LocateChunk(google::protobuf::RpcController*, const wire::LocateChunkRequest* request,
                      wire::LocateChunkResponse* response, google::protobuf::Closure* done) override {
         brpc::ClosureGuard guard(done);
@@ -26,6 +30,7 @@ class Routes final : public wire::FMasterService {
         space->set_name("pool"); space->set_id(0); space->set_total_pgs(chunkstore::global_pg_count);
         space->mutable_spec()->set_replicas(1); space->mutable_spec()->set_chunk_size(65536);
         auto* pg = route->mutable_pg(); pg->set_active(true); pg->set_id(id.pg());
+        pg->set_epoch(epoch.load());
         auto* replica = pg->add_replicas(); replica->set_server_id("s" + std::to_string(id.index));
         replica->set_endpoint("127.0.0.1:" + std::to_string(10000 + id.index));
     }
@@ -63,6 +68,14 @@ int main() {
         for (auto& worker : workers) worker.get();
         stats = client.replica_pool_stats();
         check(stats.cached_clients == 256 && stats.hits >= 153, "concurrent cache use failed");
+        const auto misses = stats.misses;
+        routes.epoch.store(7);
+        const auto refreshed = client.open_chunk(id(400));
+        check(refreshed.route().pg().epoch() == 7 && client.replica_pool_stats().misses == misses + 1,
+              "new PG epoch reused old replica client");
+        client.open_chunk(id(400));
+        check(client.replica_pool_stats().misses == misses + 1 && retained.route().pg().epoch() == 0,
+              "epoch cache miss repeated or existing handle changed");
         server.Stop(0); server.Join();
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

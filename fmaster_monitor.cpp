@@ -32,6 +32,7 @@ struct Monitor::Impl {
             : owner(monitor) {
             *request.mutable_server() = server;
             request.set_config_revision(revision);
+            owner.store.retirement_directives(server.id(), request);
         }
 
         void launch(wire::FServerStatusService_Stub& stub) {

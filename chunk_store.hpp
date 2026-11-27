@@ -1,6 +1,8 @@
 #pragma once
 
 #include "traffic_limiter.hpp"
+#include "pg_inventory.hpp"
+#include "chunk_state.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -12,8 +14,6 @@
 #include <string_view>
 
 namespace chunkstore {
-
-enum class State { Open, Frozen };
 
 struct ReplicaInfo {
     std::uint64_t length;
@@ -51,6 +51,10 @@ class ChunkFrozen : public std::logic_error {
 public:
     using std::logic_error::logic_error;
 };
+class ChunkSealed : public std::logic_error {
+public:
+    using std::logic_error::logic_error;
+};
 
 class WriteUnavailable : public std::runtime_error {
 public:
@@ -79,32 +83,38 @@ class ChunkStore {
 public:
     explicit ChunkStore(const std::filesystem::path& directory, std::uint64_t rate = TrafficLimiter::default_rate);
     TrafficLimiter& traffic();
+    PGInventory& inventory();
     ~ChunkStore();
 
     ChunkStore(const ChunkStore&) = delete;
     ChunkStore& operator=(const ChunkStore&) = delete;
 
     // Returned descriptors are owned by the caller.
-    int open_snapshot(std::string_view id, ReplicaInfo& info);
-    int open_repair_file(std::string_view id);
-    void install_replica(std::string_view id, int fd, const ReplicaInfo& info);
+    int open_snapshot(std::string_view id, ReplicaInfo& info, std::uint64_t epoch = 0, std::uint64_t recovery_token = 0,
+                      bool require_closed = true);
+    int open_repair_file(std::string_view id, std::uint64_t epoch = 0, std::uint64_t recovery_token = 0);
+    void install_replica(std::string_view id, int fd, const ReplicaInfo& info, std::uint64_t epoch = 0, std::uint64_t recovery_token = 0);
 
-    State create_chunk(std::string_view id, std::uint64_t capacity);
-    AppendResult append(std::string_view id, std::string_view data);
+    State create_chunk(std::string_view id, std::uint64_t capacity, std::uint64_t epoch = 0);
+    AppendResult append(std::string_view id, std::string_view data, std::uint64_t epoch = 0);
     // Appends contiguous buffers with one sync. Returns the whole range.
-    AppendResult append_batch(std::string_view id, std::span<const std::string_view> buffers);
-    AppendWindow append_window(std::string_view id);
+    AppendResult append_batch(std::string_view id, std::span<const std::string_view> buffers, std::uint64_t epoch = 0);
+    AppendWindow append_window(std::string_view id, std::uint64_t epoch = 0);
     // Processes requests in order and syncs accepted bytes once.
-    void append_group(std::string_view id, std::span<AppendGroupItem> requests);
+    void append_group(std::string_view id, std::span<AppendGroupItem> requests, std::uint64_t epoch = 0);
     // Reads exactly output.size() bytes into the caller's buffer.
-    State read_chunk(std::string_view id, std::uint64_t offset, std::span<char> output);
-    std::string read_chunk(std::string_view id, std::uint64_t offset, std::size_t length);
-    std::uint64_t delete_chunk(std::string_view id);
-    State restore_chunk(std::string_view id, std::uint64_t deleted_at_ns);
+    State read_chunk(std::string_view id, std::uint64_t offset, std::span<char> output, std::uint64_t epoch = 0);
+    std::string read_chunk(std::string_view id, std::uint64_t offset, std::size_t length, std::uint64_t epoch = 0);
+    std::uint64_t delete_chunk(std::string_view id, std::uint64_t epoch = 0);
+    State restore_chunk(std::string_view id, std::uint64_t deleted_at_ns, std::uint64_t epoch = 0);
     std::uint64_t freeze_chunk(std::string_view id);
-    std::uint64_t freeze_chunk(std::string_view id, std::optional<std::uint64_t> expected_length);
+    std::uint64_t freeze_chunk(std::string_view id, std::optional<std::uint64_t> expected_length, std::uint64_t epoch = 0);
+    std::uint64_t seal_chunk(std::string_view id, std::uint64_t recovery_token,
+                            std::optional<std::uint64_t> expected_length = std::nullopt);
 
 private:
+    std::uint64_t close_chunk(std::string_view id, std::optional<std::uint64_t> expected_length,
+                              std::uint64_t epoch, std::uint64_t recovery_token, State state);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

@@ -1,6 +1,6 @@
 # FStore
 
-Linux C++20 存储服务，包含 FMaster 集群配置与状态管理，以及 FServer Chunk 服务，使用 Apache bRPC 的二进制 `baidu_std` 协议。每个 Chunk 对应一个普通文件，文件中存放原始字节，`.open` 和 `.frozen` 后缀表示状态。数据目录由服务进程独占。
+Linux C++20 存储服务，包含 FMaster 集群配置与状态管理，以及 FServer Chunk 服务，使用 Apache bRPC 的二进制 `baidu_std` 协议。每个 Chunk 对应一个普通文件，文件中存放原始字节，`.open` 和 `.frozen` 后缀表示可写/只读；只读文件通过扩展属性区分用户 Freeze 与后台 Seal。数据目录由服务进程独占。
 
 ## 编译与启动
 
@@ -98,6 +98,18 @@ Chunk ID 为 `seq_id:48 | space_id:8 | index:64`，共 120 位。PG 由固定的
 
 索引通过可逆哈希直接生成，使用 `next_cursor` 分批分配；index 本身不保证递增。默认起点按 Blob 分散到已绑定 PG，避免小 Blob 集中在第一个 PG。`SpaceClient` 根据路由执行多副本读写，并缓存最多 256 套副本客户端供不同 Chunk 复用。元数据、独占绑定、分配游标与 SDK 用法见 [Space 与 PG 说明](docs/spaces.md)。
 
+FServer 启动时扫描活动 Chunk 文件，重建内存中的 `PG → Chunk` 清单；创建、冻结、删除、恢复和修复安装同步更新清单。FMaster 连续探测失败满 10 分钟后，选择符合 Space 放置策略的替代节点，执行 `repair → 封存全部 Chunk → 源节点推送数据 → 核对清单 → normal`。进度、路由版本和节点上的隔离状态均持久化，支持中途重启继续。存活副本数据不一致时停止自动推进并记录错误。
+
+```sh
+./build/fmaster_cli 127.0.0.1:8090 recoveries [SPACE [AFTER_ID [LIMIT]]]
+./build/chunk_cli 127.0.0.1:8080 pgs [START [LIMIT]]
+./build/chunk_cli 127.0.0.1:8080 pg-chunks PG_ID [AFTER_CHUNK [LIMIT]]
+```
+
+恢复状态、故障处理、SDK 路由刷新及当前限制见 [PG 故障恢复](docs/pg-recovery.md)。
+
+用户 `FreezeChunk` 产生 `Frozen / USER_FREEZE`，后台 `SealChunk`、`SealPG` 产生 `Sealed / PG_REPAIR`，首次关闭原因随文件持久化、复制和回收站恢复保留。两者都永久禁止追加；`FencePG` 是独立的 PG 临时写隔离。`chunk_cli ENDPOINT state ID [--pg-epoch=N]` 可以查看细分状态，PG 清单也返回 `close_reason`。协议旧 `frozen` 字段对两种只读状态都为 true，以兼容旧 SDK。
+
 ## Onebox 与测试
 
 本机 onebox 默认启动 1 个 FMaster、3 个 FServer，每个 FServer 登记 2 个盘目录。各进程有独立的数据目录和日志，端口自动分配。Chunk 数据使用每台 FServer 的第一个目录，全部盘目录参加状态探测。
@@ -177,14 +189,14 @@ client.freeze_chunk(id, offset + length);
 
 整体读接口 `client.read_chunk(id, offset, length)` 返回一份 Chunk 数据，CLI 支持 `chunk_cli "$replicas" read "$id" OFFSET LENGTH`。先读取配置中的第一个副本，成功响应带 frozen 时直接返回。首个副本未冻结或读取失败时，并发读取其余副本。任意成功响应带 frozen 即可返回该数据，否则请求范围内完全相同的数据达到多数派 `floor(N/2) + 1` 即可返回，N 是配置中的副本总数。未达多数派时抛出 `ReplicaCommitError`，错误信息包括各副本的失败原因或相同内容的票数。旧服务端缺少冻结状态字段时按未冻结处理。
 
-已收到的 frozen 响应优先于未冻结数据的票数。满足 frozen 或 quorum 条件后会取消其余 RPC 并返回，多数派结果无需等待慢副本。该规则信任单个副本的冻结状态，即使其他副本尚未完成冻结也可返回。
+已收到的只读响应优先于未关闭数据的票数。这里的协议 `frozen=true` 同时涵盖用户 Frozen 和后台 Sealed。满足只读或 quorum 条件后会取消其余 RPC 并返回，多数派结果无需等待慢副本。该规则信任单个副本的不可追加状态，即使其他副本尚未完成关闭也可返回。
 
-逐副本读接口 `client.read_replicas(id, offset, length)` 并发读取所有副本，等待各自成功、失败或超时后，按配置地址顺序返回 `std::vector<ReplicaReadResult>`。每项包含 `endpoint`、`data`、`frozen` 和 `error`，不同副本的数据和状态逐条保留。成功时 `data` 是原始 `butil::IOBuf`，`frozen` 是 `std::optional<bool>`，旧服务端缺少状态字段时为空。失败时 `error` 保存该副本的异常，数据和状态为空，其他副本的成功结果仍然返回。可用 `std::rethrow_exception(reply.error)` 获取 `RpcError` 或 `RemoteChunkError`。超时使用 `ClientOptions`，超过 8 MiB 的读取长度会直接抛出 `std::length_error`。
+逐副本读接口 `client.read_replicas(id, offset, length)` 并发读取所有副本，等待各自成功、失败或超时后，按配置地址顺序返回 `std::vector<ReplicaReadResult>`。每项包含 `endpoint`、`data`、`frozen`、`state` 和 `error`，不同副本的数据和状态逐条保留。成功时 `data` 是原始 `butil::IOBuf`，`frozen` 是兼容的只读标志，`state` 是 `std::optional<State>`，区分 Open、Frozen 和 Sealed；旧服务端缺少状态字段时为空。失败时 `error` 保存该副本的异常，数据和状态为空，其他副本的成功结果仍然返回。可用 `std::rethrow_exception(reply.error)` 获取 `RpcError` 或 `RemoteChunkError`。单节点 `read_with_state()` 也返回数据和细分状态。超时使用 `ClientOptions`，超过 8 MiB 的读取长度会直接抛出 `std::length_error`。
 
 ```cpp
 const auto data = client.read_chunk(id, offset, length);
 const auto replicas = client.read_replicas(id, offset, length);
-// replicas[i].endpoint、data、frozen、error 对应第 i 个配置副本。
+// replicas[i].endpoint、data、state、frozen、error 对应第 i 个配置副本。
 ```
 
 运行 `python3 tests/replicated_client.py build` 可验证三个独立 server 的并发写入、节点掉线与恢复、重复提交、冲突检测、条件封存、任意副本冻结读取、多数派数据比较、慢副本取消及逐副本数据与错误返回。
@@ -198,8 +210,9 @@ const auto replicas = client.read_replicas(id, offset, length);
 | `ReadChunk` | Chunk ID、偏移、长度 | 响应 attachment 中的原始字节 |
 | `FreezeChunk` | Chunk ID | 最终字节长度，重复封存返回相同长度 |
 | `FreezeChunkAtLength` | Chunk ID、预期最终字节长度 | 长度匹配时封存并返回长度，长度有差异时返回 `LENGTH_MISMATCH` |
+| `SealChunk` | Chunk ID、恢复 token、可选预期长度 | 后台封存并返回长度，要求匹配的 SOURCE PG fence |
 | `DeleteChunk` | Chunk ID | 本次删除的 Unix 纳秒时间戳，用于恢复 |
-| `RestoreChunk` | Chunk ID、删除时间戳 | 恢复后的 OPEN 或 FROZEN 状态 |
+| `RestoreChunk` | Chunk ID、删除时间戳 | 恢复后的 Open、Frozen 或 Sealed 状态 |
 
 协议定义见 `chunk.proto`。Chunk ID 为 120 位（`seq_id:48 | space_id:8 | index:64`），使用 30 位小写十六进制字符串。仅 index 的固定哈希决定全局 PG，同一 Blob 共用序号；底层接口兼容已有的 24/32 位十六进制 ID。单次追加、读取各限 8 MiB。小记录可以用 `butil::IOBuf` 拼成一个请求，共用一次落盘同步。追加在同步成功后才返回。客户端用 `RpcError` 表示 RPC 调用失败，用 `RemoteChunkError` 表示服务端业务错误。
 
@@ -251,6 +264,8 @@ const auto replicas = client.read_replicas(id, offset, length);
 | 修复 | 优先级之间可并行校验、写块和同步文件。接收端用会话锁登记和清理传输，在分块写入和文件同步前释放该锁。 |
 
 同一 Chunk 的修改保留写锁，追加仍在 `fdatasync` 成功后发布长度并确认。文件系统、bRPC 内部和空闲等待也有各自的同步机制。
+
+120 位 Chunk 的数据操作还持有 PG 级共享隔离锁，使恢复切换能等待已经进入存储层的操作完成。每线程缓存最近访问的 PG，命中时避开全局 PG 索引锁；心跳中的 Chunk 总数通过原子计数读取。PG 成员清单只在成员或冻结状态改变时更新，普通追加和读取不修改清单。本实现不是全链路无锁。
 
 仓库附带使用长连接 C++ SDK 的压测工具。使用临时数据目录启动 server，每轮追加测量都会创建新 Chunk。下面依次测量 16 并发热点读、16 并发单副本追加和 8 并发三副本追加。参数为操作、并发线程数、每线程操作数、每次请求字节数和服务地址。
 
@@ -306,13 +321,13 @@ cmake --build build --target chunk_bench -j
 ./build/chunk_cli 10.0.0.1:8080 repair 0123456789abcdef0123456789abcdef 10.0.0.2:8080
 ```
 
-C++ 客户端用连接到 A 的实例调用 `source.repair_chunk(id, "10.0.0.2:8080")`。可用第三个参数设置整次 RPC 的超时，默认 300,000 ms。指定高优先级时调用 `source.repair_chunk(id, destination, chunkstore::rpc::v1::HIGH)`，也可在第四个参数设置超时。A 以自己的 FROZEN 副本为权威数据源。源为 OPEN 时，A 在发送数据前返回 `REPAIR_CONFLICT`。
+C++ 客户端用连接到 A 的实例调用 `source.repair_chunk(id, "10.0.0.2:8080")`。可用第三个参数设置整次 RPC 的超时，默认 300,000 ms。指定高优先级时调用 `source.repair_chunk(id, destination, chunkstore::rpc::v1::HIGH)`，也可在第四个参数设置超时。A 以自己的 Frozen 或 Sealed 只读副本为数据源。源为 Open 时，A 在发送数据前返回 `REPAIR_CONFLICT`。
 
 | B 上的副本 | 发布规则 |
 |---|---|
-| 缺失 | 创建 FROZEN 副本，保留 A 的容量和数据 |
+| 缺失 | 创建只读副本，保留 A 的容量、数据及关闭原因 |
 | OPEN | 返回 `REPAIR_CONFLICT`，即使已有字节与源完全一致 |
-| FROZEN | 使用 A 的 FROZEN 快照替换整个副本，可修复丢失或损坏的字节 |
+| Frozen / Sealed | 使用 A 的只读快照替换整个副本，数据与关闭原因一起原子安装 |
 
 B 验证每块的顺序、长度和 CRC32C，在分片目录所在文件系统的匿名临时文件中暂存，通过最终文件同步、重命名和目录同步完成发布。需要本地文件系统支持 `O_TMPFILE`、用户扩展属性和通过 `/proc/self/fd` 发布匿名文件。B 会保留旧副本供读取，暂存空间需能容纳完整的新快照。
 
@@ -327,6 +342,6 @@ deleted_at=$(./build/chunk_cli "$server" delete "$id")
 ./build/chunk_cli "$server" restore "$id" "$deleted_at"
 ```
 
-删除只作用于当前节点，OPEN 和 FROZEN 均可删除。服务将整个文件原子移入同一分片的 `.trash/<id>.<删除时间戳>.open|frozen`，同步目录后返回。后续读取、追加、封存和重复删除返回 `NOT_FOUND`。保留期内可用删除返回的时间戳恢复指定版本，数据、容量和封存状态随文件保留。可以重新创建同 ID 的 Chunk。若该 ID 已在线，恢复会返回 `RESTORE_CONFLICT`。
+删除只作用于当前节点，Open、Frozen、Sealed 均可删除。服务将整个文件原子移入同一分片的 `.trash/<id>.<删除时间戳>.open|frozen`，同步目录后返回。后续读取、追加、关闭和重复删除返回 `NOT_FOUND`。保留期内可用删除返回的时间戳恢复指定版本，数据、容量和关闭原因随文件保留。可以重新创建同 ID 的 Chunk。若该 ID 已在线，恢复会返回 `RESTORE_CONFLICT`。
 
 保留期从删除时刻起满 24 小时，以文件名中的时间戳跨重启计算。过期后立即失去恢复资格。服务启动时扫描回收站，此后每分钟后台扫描一次，清除已过期的条目。节点停机期间到期的条目在下次启动后清理。

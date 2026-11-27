@@ -47,6 +47,12 @@ public:
     void allocate_chunks(const wire::AllocateChunksRequest&, wire::AllocateChunksResponse&);
     void allocate_blobs(const wire::AllocateBlobsRequest&, wire::AllocateBlobsResponse&);
     void locate_chunk(const wire::LocateChunkRequest&, wire::LocateChunkResponse&) const;
+    void list_recoveries(const wire::ListRecoveriesRequest&, wire::ListRecoveriesResponse&) const;
+    void plan_recoveries(std::uint64_t now_ms, std::uint64_t grace_ms = 600000, std::uint32_t scan_limit = 256);
+    void advance_recovery(std::uint64_t id, wire::RecoveryPhase expected, wire::RecoveryPhase next,
+                          const std::string& cursor = {}, std::uint64_t chunks = 0, std::uint64_t bytes = 0);
+    void recovery_error(std::uint64_t id, const std::string& error);
+    void retirement_directives(const std::string& server, wire::ServerHeartbeatRequest&) const;
     void record_heartbeat(const wire::HeartbeatReport& report);
     void record_probe_failure(const std::string& server_id, const std::string& endpoint,
                               std::uint64_t config_revision, const std::string& error);

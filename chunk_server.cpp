@@ -1,6 +1,7 @@
 #include "chunk_store.hpp"
 #include "mpsc_inbox.hpp"
 #include "chunk_repair.hpp"
+#include "chunk_id.hpp"
 #include "chunk_rpc_limits.hpp"
 #include "chunk.pb.h"
 #include "fserver_heartbeat.hpp"
@@ -115,6 +116,8 @@ void complete(google::protobuf::Closure* done, rpc::Status& status, Operation op
         fail(status, rpc::RESTORE_CONFLICT, e.what());
     } catch (const chunkstore::RepairConflict& e) {
         fail(status, rpc::REPAIR_CONFLICT, e.what());
+    } catch (const chunkstore::ChunkSealed&) {
+        fail(status, rpc::SEALED, "chunk was sealed for PG repair");
     } catch (const chunkstore::ChunkFrozen&) {
         fail(status, rpc::FROZEN, "chunk is frozen");
     } catch (const chunkstore::WriteUnavailable& e) {
@@ -166,6 +169,70 @@ public:
                 work(queues_[i], stop, i < polling_.workers ? polling_.budget : PollTime::zero());
             });
         }
+    }
+
+    void ListLocalPGs(google::protobuf::RpcController* controller, const rpc::ListLocalPGsRequest* request,
+                      rpc::ListLocalPGsResponse* response, google::protobuf::Closure* done) override {
+        submit(controller, done, *response->mutable_status(), [this, request, response] {
+            const auto pgs = store_.inventory().list(request->start(), request->limit() ? request->limit() : 100);
+            for (const auto& pg : pgs) {
+                auto* item = response->add_pgs(); item->set_pg_id(pg.id); item->set_chunk_count(pg.count); item->set_open_count(pg.open_count);
+            }
+            if (!pgs.empty() && pgs.back().id + 1 < chunkstore::global_pg_count) response->set_next_start(pgs.back().id + 1);
+        });
+    }
+    void GetPGInventory(google::protobuf::RpcController* controller, const rpc::PGInventoryRequest* request,
+                        rpc::PGInventoryResponse* response, google::protobuf::Closure* done) override {
+        submit(controller, done, *response->mutable_status(), [this, request, response] {
+            const auto page = store_.inventory().page(request->pg_id(), request->after_chunk(), request->limit() ? request->limit() : 100);
+            for (const auto& chunk : page.chunks) { auto* item = response->add_chunks(); item->set_chunk_id(chunk.id); chunkstore::detail::set_wire_state(*item, chunk.state); }
+            if (page.next) response->set_next_chunk(*page.next);
+            response->set_chunk_count(page.count); response->set_open_count(page.open_count); response->set_generation(page.generation);
+            response->set_recovery_token(page.token); response->set_pg_epoch(page.epoch); response->set_mode(static_cast<rpc::PGFenceMode>(page.mode));
+        });
+    }
+    void SetPGFence(google::protobuf::RpcController* controller, const rpc::PGFenceRequest* request,
+                    rpc::PGFenceResponse* response, google::protobuf::Closure* done) override {
+        FencePG(controller, request, response, done);
+    }
+    void FencePG(google::protobuf::RpcController* controller, const rpc::PGFenceRequest* request,
+                  rpc::PGFenceResponse* response, google::protobuf::Closure* done) override {
+        submit(controller, done, *response->mutable_status(), [this, request] {
+            store_.inventory().fence(request->pg_id(), request->recovery_token(), request->expected_epoch(),
+                                     static_cast<chunkstore::PGMode>(request->mode()));
+        });
+    }
+    void RepairPG(google::protobuf::RpcController* controller, const rpc::RepairPGRequest* request,
+                  rpc::RepairPGResponse* response, google::protobuf::Closure* done) override {
+        brpc::ClosureGuard guard(done);
+        if (!accept_protocol(*static_cast<brpc::Controller*>(controller))) return;
+        auto& status = *response->mutable_status();
+        if (!rpc::CopyPriority_IsValid(request->priority())) { fail(status, rpc::INVALID_ARGUMENT, "invalid copy priority"); return; }
+        try {
+            std::lock_guard lock(sender_mutex_);
+            auto& queue = sends_[request->priority()];
+            if (queue.size() >= 4) { fail(status, rpc::WRITE_UNAVAILABLE, "copy queue full"); return; }
+            queue.emplace_back([this, request, response, done, &status] {
+                complete(done, status, [&] { chunkstore::push_pg(store_, *request, *response); });
+            });
+            guard.release(); sender_available_.notify_all();
+        } catch (const std::exception& error) { fail(status, rpc::REPAIR_FAILED, error.what()); }
+    }
+
+    void SealPG(google::protobuf::RpcController* controller, const rpc::SealPGRequest* request,
+                rpc::PGInventoryResponse* response, google::protobuf::Closure* done) override {
+        brpc::ClosureGuard guard(done);
+        if (!accept_protocol(*static_cast<brpc::Controller*>(controller))) return;
+        auto& status = *response->mutable_status();
+        try {
+            std::lock_guard lock(sender_mutex_);
+            auto& queue = sends_[rpc::NORMAL];
+            if (queue.size() >= 4) { fail(status, rpc::WRITE_UNAVAILABLE, "copy queue full"); return; }
+            queue.emplace_back([this, request, response, done, &status] {
+                complete(done, status, [&] { chunkstore::seal_pg(store_, *request, *response); });
+            });
+            guard.release(); sender_available_.notify_all();
+        } catch (const std::exception& error) { fail(status, rpc::REPAIR_FAILED, error.what()); }
     }
 
     void GetTrafficStats(google::protobuf::RpcController* controller, const rpc::TrafficStatsRequest*,
@@ -229,8 +296,7 @@ public:
     void CreateChunk(google::protobuf::RpcController* controller, const rpc::CreateRequest* request,
                      rpc::CreateResponse* response, google::protobuf::Closure* done) override {
         submit(controller, done, *response->mutable_status(), [this, request, response] {
-            response->set_frozen(store_.create_chunk(request->chunk_id(), request->capacity()) ==
-                                 chunkstore::State::Frozen);
+            chunkstore::detail::set_wire_state(*response, store_.create_chunk(request->chunk_id(), request->capacity(), request->pg_epoch()));
             response->set_capacity(request->capacity());
         }, &request->chunk_id());
     }
@@ -263,7 +329,7 @@ public:
             Clock::now() + std::chrono::milliseconds(timeout);
         auto* counted = reserve(guard, done, status, TrafficLane::Online);
         if (counted) admit(guard, status, &request->chunk_id(),
-                        Job{{}, &data, response, counted, request->offset(), deadline},
+                        Job{{}, &data, response, counted, request->offset(), deadline, rpc::OK, request->pg_epoch()},
                         counted, TrafficLane::Online, data.size());
     }
 
@@ -278,11 +344,11 @@ public:
             const auto length = static_cast<std::size_t>(request->length());
             auto* brpc_controller = static_cast<brpc::Controller*>(controller);
             if (length == 0) {
-                response->set_frozen(store_.read_chunk(request->chunk_id(), request->offset(), std::span<char>{}) == chunkstore::State::Frozen);
+                chunkstore::detail::set_wire_state(*response, store_.read_chunk(request->chunk_id(), request->offset(), std::span<char>{}, request->pg_epoch()));
                 return;
             }
             auto data = std::make_unique_for_overwrite<char[]>(length);
-            response->set_frozen(store_.read_chunk(request->chunk_id(), request->offset(), std::span(data.get(), length)) == chunkstore::State::Frozen);
+            chunkstore::detail::set_wire_state(*response, store_.read_chunk(request->chunk_id(), request->offset(), std::span(data.get(), length), request->pg_epoch()));
             if (brpc_controller->response_attachment().append_user_data(
                     data.get(), length, [](void* p) { delete[] static_cast<char*>(p); }) != 0) {
                 fail(status, rpc::STORAGE_ERROR, "could not attach read data");
@@ -295,7 +361,7 @@ public:
     void DeleteChunk(google::protobuf::RpcController* controller, const rpc::ChunkRequest* request,
                      rpc::DeleteResponse* response, google::protobuf::Closure* done) override {
         submit(controller, done, *response->mutable_status(), [this, request, response] {
-            response->set_deleted_at_ns(store_.delete_chunk(request->chunk_id()));
+            response->set_deleted_at_ns(store_.delete_chunk(request->chunk_id(), request->pg_epoch()));
             repairs_.discard(request->chunk_id());
         }, &request->chunk_id());
     }
@@ -303,23 +369,30 @@ public:
     void RestoreChunk(google::protobuf::RpcController* controller, const rpc::RestoreRequest* request,
                       rpc::RestoreResponse* response, google::protobuf::Closure* done) override {
         submit(controller, done, *response->mutable_status(), [this, request, response] {
-            response->set_frozen(store_.restore_chunk(request->chunk_id(), request->deleted_at_ns()) ==
-                                 chunkstore::State::Frozen);
+            chunkstore::detail::set_wire_state(*response, store_.restore_chunk(request->chunk_id(), request->deleted_at_ns(), request->pg_epoch()));
         }, &request->chunk_id());
     }
 
     void FreezeChunk(google::protobuf::RpcController* controller, const rpc::ChunkRequest* request,
                      rpc::FreezeResponse* response, google::protobuf::Closure* done) override {
         submit(controller, done, *response->mutable_status(), [this, request, response] {
-            response->set_length(store_.freeze_chunk(request->chunk_id()));
+            response->set_length(store_.freeze_chunk(request->chunk_id(), std::nullopt, request->pg_epoch()));
         }, &request->chunk_id());
+    }
+
+    void SealChunk(google::protobuf::RpcController* controller, const rpc::SealChunkRequest* request,
+                   rpc::SealResponse* response, google::protobuf::Closure* done) override {
+        submit(controller, done, *response->mutable_status(), [this, request, response] {
+            response->set_length(store_.seal_chunk(request->chunk_id(), request->recovery_token(),
+                request->has_expected_length() ? std::optional<std::uint64_t>(request->expected_length()) : std::nullopt));
+        }, &request->chunk_id(), TrafficLane::CopyNormal);
     }
 
     void FreezeChunkAtLength(google::protobuf::RpcController* controller,
                              const rpc::FreezeAtLengthRequest* request, rpc::FreezeResponse* response,
                              google::protobuf::Closure* done) override {
         submit(controller, done, *response->mutable_status(), [this, request, response] {
-            response->set_length(store_.freeze_chunk(request->chunk_id(), request->expected_length()));
+            response->set_length(store_.freeze_chunk(request->chunk_id(), request->expected_length(), request->pg_epoch()));
         }, &request->chunk_id());
     }
 
@@ -336,6 +409,7 @@ private:
         std::uint64_t offset = 0;
         Clock::time_point deadline = Clock::time_point::max();
         rpc::Code rejection = rpc::OK;
+        std::uint64_t pg_epoch = 0;
     };
 
     struct WriteQueue;
@@ -679,7 +753,7 @@ private:
             } else {
                 chunkstore::AppendWindow window{};
                 try {
-                    window = store_.append_window(*task.chunk_id);
+                    window = store_.append_window(*task.chunk_id, pending.front().pg_epoch);
                 } catch (...) {
                     failure = std::current_exception();
                 }
@@ -742,7 +816,10 @@ private:
                 }
                 buffers = buffers.subspan(count);
             }
-            store_.append_group(id, std::span(requests).first(group.size()));
+            for (const auto& job : group) {
+                if (job.pg_epoch != group.front().pg_epoch) throw chunkstore::WriteUnavailable("mixed PG epochs in queued appends; refresh route");
+            }
+            store_.append_group(id, std::span(requests).first(group.size()), group.front().pg_epoch);
         } catch (...) {
             failure = std::current_exception();
         }
@@ -846,7 +923,7 @@ int main(int argc, char** argv) {
         std::unique_ptr<chunkstore::FServerStatusService> heartbeat;
         if (server_id) {
             heartbeat = std::make_unique<chunkstore::FServerStatusService>(
-                *server_id, advertised_endpoint.value_or(endpoint));
+                *server_id, advertised_endpoint.value_or(endpoint), &store);
         }
         brpc::FLAGS_max_body_size = (server_id ? 16 * 1024 * 1024 : chunkstore::max_rpc_payload) + 64 * 1024;
         brpc::Server server;

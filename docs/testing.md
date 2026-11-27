@@ -47,6 +47,22 @@ FMaster 主动调用每台 FServer 的状态接口。集成测试同时运行两
 
 ## 存储与多副本
 
+`chunk_closure` UT 覆盖 USER_FREEZE / PG_REPAIR 区分、首次关闭原因不被交叉调用覆盖、并发 Freeze/Seal、缺失或错误 token、长度校验、重启扫描、删除恢复、修复原子替换原因、旧文件兼容、rename 前残留属性和损坏原因拒绝。`chunk_closure_rpc` 通过受控 bRPC 回复验证单节点及逐副本 SDK 的细分状态、Sealed 的只读快速读取、旧回复兼容与非法枚举/矛盾字段拒绝。
+
+`pg_recovery` 还检查 33 个真实 Chunk 的两种关闭原因，在存活源和新目标上的文件属性均一致；覆盖 SOURCE fence 下单 Chunk Seal RPC 的 token 校验、源和目标 SIGKILL 后重启、Sealed 的追加错误码、删除恢复和 SDK 细分状态。
+
+```sh
+ctest --test-dir build -R '^(chunk_closure|chunk_closure_rpc|pg_recovery)$' --output-on-failure
+```
+
+新增 `pg_inventory` UT 覆盖启动扫描、动态清单、分页、回收站排除、修复安装、持久化隔离、旧 epoch 拒绝、在途操作屏障与损坏文件拒绝。`fmaster_recovery` UT 覆盖默认 10 分钟边界、故障计时跨重启、必须重新探测、恢复进度持久化、完成前不发布路由、机房/能力/替代节点约束、多副本故障以及无数据源场景。时间边界直接传入调度时刻，不让 UT 实际等待 10 分钟。
+
+`pg_recovery` 集成测试运行真实 FMaster 和四台 FServer，创建 33 个跨多个复制批次的 Chunk，其中一部分未封存。SIGKILL 一个副本后验证宽限期、PG 自动封存、源主动推送、COPYING 中 SIGKILL FMaster 和源节点后继续、最终每个目标文件的数据、SDK 新 epoch、旧路由拒绝及旧节点重新上线退役。同时通过真实单副本追加制造未完成的多副本写，确认另一个 PG 因内容分歧停留在 repair，且不会复制或提前发布正常路由。集成测试将宽限期配置为 1.5 秒；生产默认 10 分钟由 UT 验证。
+
+```sh
+ctest --test-dir build -R '^(pg_inventory|fmaster_recovery|pg_recovery)$' --output-on-failure
+```
+
 ```sh
 ctest --test-dir build -R 'replicated_client|read_version|worker_polling' --output-on-failure
 ctest --test-dir build -R 'chunk_repair|chunk_trash|traffic_integration' --output-on-failure

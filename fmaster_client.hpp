@@ -43,6 +43,7 @@ public:
     std::uint64_t remove_disk(const wire::RemoveDiskRequest& request) const;
     std::uint64_t apply_config(const wire::ApplyConfigRequest& request) const;
     wire::ValidateConfigResponse validate_config(const wire::ValidateConfigRequest& request) const;
+    wire::ListRecoveriesResponse list_recoveries(const wire::ListRecoveriesRequest& request) const;
     wire::SpaceResponse create_space(const wire::CreateSpaceRequest& request) const;
     wire::SpaceResponse bind_pgs(const wire::BindPGsRequest& request) const;
     wire::SpaceResponse unbind_pgs(const wire::BindPGsRequest& request) const;

@@ -15,8 +15,11 @@ SpaceClient::SpaceClient(const std::string& endpoint, std::string space, ClientO
 }
 
 SpaceChunk SpaceClient::make_chunk(master::wire::ChunkRoute route, const std::vector<std::string>& endpoints) const {
-    auto replicas = pool_->get(endpoints, [&](const auto& targets) {
-        return std::make_shared<ReplicatedChunkClient>(targets, options_);
+    auto key = endpoints;
+    key.push_back("pg-epoch:" + std::to_string(route.pg().epoch()));
+    auto options = options_; options.pg_epoch = route.pg().epoch();
+    auto replicas = pool_->get(key, [&](const auto&) {
+        return std::make_shared<ReplicatedChunkClient>(endpoints, options);
     });
     return SpaceChunk(std::move(route), std::move(replicas));
 }

@@ -202,7 +202,7 @@ void verify_limits(const fs::path& root) {
     { master::Store upgraded(root / "empty-legacy"); }
     std::ifstream input(root / "empty-legacy" / "spaces.pb", std::ios::binary);
     char magic[8]; input.read(magic, 8);
-    check(std::string(magic, 8) == "FSPACE03", "empty legacy catalog not upgraded");
+    check(std::string(magic, 8) == "FSPACE04", "empty legacy catalog not upgraded");
     legacy.add_spaces()->mutable_space()->set_name("old-space");
     write_catalog(root / "allocated-legacy", legacy, "FSPACE02");
     rejected([&] { master::Store unsupported(root / "allocated-legacy"); });

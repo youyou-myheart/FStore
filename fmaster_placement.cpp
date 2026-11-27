@@ -56,6 +56,10 @@ wire::PlacementGroup group(const wire::SpaceState& state, std::uint32_t pg) {
     result.set_id(pg);
     if (!owns_pg(state, pg)) return result;
     result.set_active(true);
+    const auto overridden = std::lower_bound(state.overrides().begin(), state.overrides().end(), pg,
+        [](const wire::PlacementGroup& value, std::uint32_t id) { return value.id() < id; });
+    if (overridden != state.overrides().end() && overridden->id() == pg) return *overridden;
+
     const auto range = std::lower_bound(state.ranges().begin(), state.ranges().end(), pg,
         [](const wire::PGRange& value, std::uint32_t id) { return value.end() <= id; });
     if (range == state.ranges().end() || pg < range->begin() || range->algorithm_version() != 1) {
@@ -141,13 +145,77 @@ void validate_catalog(const wire::SpaceCatalog& catalog) {
                         "placement candidate is outside allowed datacenters");
             }
             // Feasibility depends on candidate counts, not on the hash order.
-            group(state, range.begin());
+            wire::SpaceState check; *check.mutable_space() = space; *check.add_ranges() = range;
+            group(check, range.begin());
             next = range.end();
             bound += range.end() - range.begin();
             global_ranges.emplace_back(range.begin(), range.end());
         }
         require(bound == space.bound_pgs(), "bound PG count is inconsistent");
+        std::optional<std::uint32_t> previous_pg;
+        for (const auto& pg : state.overrides()) {
+            require(pg.active() && owns_pg(state, pg.id()) && (!previous_pg || *previous_pg < pg.id()) &&
+                    pg.epoch() <= catalog.recovery_sequence() && pg.replicas_size() == static_cast<int>(spec.replicas()), "invalid PG override");
+            wire::SpaceState check; *check.mutable_space() = space;
+            auto* pool = check.add_ranges(); pool->set_begin(pg.id()); pool->set_end(pg.id() + 1); pool->set_algorithm_version(1);
+            std::set<std::string> servers, endpoints;
+            for (const auto& node : pg.replicas()) {
+                require(!node.server_id().empty() && !node.endpoint().empty() && servers.insert(node.server_id()).second && endpoints.insert(node.endpoint()).second,
+                        "duplicate override replica");
+                const auto& allowed = spec.placement_policy().datacenters();
+                require(allowed.empty() || std::find(allowed.begin(), allowed.end(), node.datacenter()) != allowed.end(),
+                        "override is outside allowed datacenters");
+                *pool->add_candidates() = node;
+            }
+            group(check, pg.id()); previous_pg = pg.id();
+        }
+
     }
+    std::uint64_t previous_job = 0;
+    std::set<std::pair<std::string, std::uint32_t>> pending;
+    for (const auto& job : catalog.recoveries()) {
+        require(job.id() > previous_job && job.id() <= catalog.recovery_sequence() && job.new_pg().epoch() == job.id() &&
+                job.old_pg().epoch() < job.id() && wire::RecoveryPhase_IsValid(job.phase()) &&
+                job.old_pg().id() == job.pg_id() && job.new_pg().id() == job.pg_id() && !job.failed_servers().empty(), "invalid recovery record");
+        require(names.contains(job.space_name()), "recovery references unknown Space");
+        const auto state = std::find_if(catalog.spaces().begin(), catalog.spaces().end(), [&](const auto& item) { return item.space().name() == job.space_name(); });
+        require(owns_pg(*state, job.pg_id()) && job.old_pg().active() && job.new_pg().active() &&
+                !job.old_pg().recovering() && !job.new_pg().recovering() && job.error().size() <= 4096, "invalid recovery PG state");
+        std::set<std::string> old_members, new_members, failed_members;
+        for (const auto* pg : {&job.old_pg(), &job.new_pg()}) {
+            require(pg->replicas_size() == static_cast<int>(state->space().spec().replicas()), "invalid recovery replica count");
+            wire::SpaceState check; *check.mutable_space() = state->space();
+            auto* range = check.add_ranges(); range->set_begin(job.pg_id()); range->set_end(job.pg_id() + 1); range->set_algorithm_version(1);
+            std::set<std::string> endpoints;
+            auto& members = pg == &job.old_pg() ? old_members : new_members;
+            for (const auto& node : pg->replicas()) {
+                require(!node.server_id().empty() && !node.endpoint().empty() && members.insert(node.server_id()).second &&
+                        endpoints.insert(node.endpoint()).second, "invalid recovery member");
+                const auto& allowed = state->space().spec().placement_policy().datacenters();
+                require(allowed.empty() || std::find(allowed.begin(), allowed.end(), node.datacenter()) != allowed.end(), "recovery outside allowed datacenters");
+                *range->add_candidates() = node;
+            }
+            group(check, job.pg_id());
+        }
+        for (const auto& failed : job.failed_servers()) require(old_members.contains(failed) && !new_members.contains(failed) &&
+            failed_members.insert(failed).second, "invalid failed recovery member");
+        require(failed_members.size() < old_members.size(), "recovery has no surviving source");
+        for (const auto& node : old_members) require(new_members.contains(node) || failed_members.contains(node), "unrecorded removed replica");
+        require(job.cursor().empty() || ((job.phase() == wire::SEALING || job.phase() == wire::COPYING || job.phase() == wire::VERIFYING) &&
+                job.cursor().size() == 30 && valid_storage_chunk_id(job.cursor()) && ChunkId::parse(job.cursor()).pg() == job.pg_id()), "invalid recovery cursor");
+        if (job.phase() != wire::RECOVERED) require(pending.emplace(job.space_name(), job.pg_id()).second, "overlapping PG recoveries");
+        if (job.phase() != wire::RECOVERED) {
+            auto blocked = job.old_pg(); blocked.set_recovering(true);
+            require(group(*state, job.pg_id()).SerializeAsString() == blocked.SerializeAsString(), "active recovery route differs from old placement");
+        }
+        previous_job = job.id();
+    }
+    for (const auto& state : catalog.spaces()) for (const auto& pg : state.overrides()) {
+        require(!pg.recovering() || pending.contains({state.space().name(), pg.id()}), "repair route has no recovery job");
+    }
+    std::set<std::string> failures;
+    for (const auto& failure : catalog.failures()) require(!failure.server_id().empty() && failure.since_unix_ms() && failures.insert(failure.server_id()).second,
+                                                         "invalid server failure record");
     std::sort(global_ranges.begin(), global_ranges.end());
     std::uint32_t pg_end = 0;
     for (const auto& range : global_ranges) {
@@ -166,6 +234,16 @@ void validate_catalog(const wire::SpaceCatalog& catalog) {
 void validate_topology(const wire::SpaceCatalog& catalog, const wire::Topology& topology) {
     std::unordered_map<std::string, const wire::FServer*> servers;
     for (const auto& server : topology.servers()) servers.emplace(server.id(), &server);
+    auto check_target = [&](const wire::ReplicaTarget& node) {
+        const auto found = servers.find(node.server_id());
+        if (found == servers.end() || found->second->endpoint() != node.endpoint() || found->second->datacenter() != node.datacenter()) {
+            throw Error(wire::CONFLICT, "FServer is referenced by PG recovery: " + node.server_id());
+        }
+    };
+    for (const auto& job : catalog.recoveries()) {
+        if (job.phase() != wire::RECOVERED) for (const auto& node : job.new_pg().replicas()) check_target(node);
+    }
+    for (const auto& state : catalog.spaces()) for (const auto& pg : state.overrides()) for (const auto& node : pg.replicas()) check_target(node);
     for (const auto& state : catalog.spaces()) {
         for (const auto& range : state.ranges()) {
             for (const auto& node : range.candidates()) {

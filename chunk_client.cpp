@@ -1,4 +1,5 @@
 #include "chunk_client.hpp"
+#include "chunk_wire_state.hpp"
 #include "chunk_rpc_limits.hpp"
 
 #include <brpc/channel.h>
@@ -16,6 +17,14 @@
 
 namespace chunkstore {
 namespace {
+template<class Response> State response_state(const Response& response) {
+    try { return detail::wire_state(response); }
+    catch (const std::invalid_argument& error) { throw RpcError(EPROTO, error.what()); }
+}
+std::optional<State> read_state(const rpc::v1::ReadResponse& response) {
+    if (!response.has_frozen() && !response.has_close_reason()) return std::nullopt;
+    return response_state(response);
+}
 namespace wire = rpc::v1;
 
 void check_size(std::size_t size) {
@@ -95,8 +104,9 @@ struct ChunkClient::Impl {
     brpc::Channel channel;
     wire::ChunkService_Stub stub{&channel};
     int timeout_ms;
+    std::uint64_t pg_epoch;
 
-    Impl(const std::string& endpoint, ClientOptions options) : timeout_ms(options.timeout_ms) {
+    Impl(const std::string& endpoint, ClientOptions options) : timeout_ms(options.timeout_ms), pg_epoch(options.pg_epoch) {
         brpc::ChannelOptions settings;
         settings.protocol = brpc::PROTOCOL_BAIDU_STD;
         settings.connection_type = brpc::CONNECTION_TYPE_SINGLE;
@@ -125,6 +135,7 @@ std::uint64_t ChunkClient::repair_chunk(std::string_view id, const std::string& 
     brpc::Controller controller;
     controller.set_timeout_ms(timeout_ms);
     request.set_chunk_id(std::string(id));
+    request.set_pg_epoch(impl_->pg_epoch);
     request.set_destination(destination);
     request.set_priority(priority);
     impl_->stub.RepairChunk(&controller, &request, &response, nullptr);
@@ -141,18 +152,33 @@ rpc::v1::TrafficStatsResponse ChunkClient::traffic_stats() const {
     return response;
 }
 
+rpc::v1::ListLocalPGsResponse ChunkClient::list_pgs(std::uint32_t start, std::uint32_t limit) const {
+    wire::ListLocalPGsRequest request; request.set_start(start); request.set_limit(limit);
+    wire::ListLocalPGsResponse response; brpc::Controller controller;
+    impl_->stub.ListLocalPGs(&controller, &request, &response, nullptr);
+    check_response(controller, response); return response;
+}
+
+rpc::v1::PGInventoryResponse ChunkClient::pg_chunks(std::uint32_t pg, std::string_view after, std::uint32_t limit) const {
+    wire::PGInventoryRequest request; request.set_pg_id(pg); request.set_after_chunk(std::string(after)); request.set_limit(limit);
+    wire::PGInventoryResponse response; brpc::Controller controller;
+    impl_->stub.GetPGInventory(&controller, &request, &response, nullptr);
+    check_response(controller, response); return response;
+}
+
 State ChunkClient::create_chunk(std::string_view id, std::uint64_t capacity) const {
     wire::CreateRequest request;
     wire::CreateResponse response;
     brpc::Controller controller;
     request.set_chunk_id(std::string(id));
+    request.set_pg_epoch(impl_->pg_epoch);
     request.set_capacity(capacity);
     impl_->stub.CreateChunk(&controller, &request, &response, nullptr);
     check_response(controller, response);
     if (response.capacity() != capacity) {
         throw RpcError(EPROTO, "create response capacity mismatch");
     }
-    return response.frozen() ? State::Frozen : State::Open;
+    return response_state(response);
 }
 
 AppendResult ChunkClient::append(std::string_view id, std::uint64_t offset,
@@ -166,6 +192,7 @@ AppendResult ChunkClient::append(std::string_view id, std::uint64_t offset,
     wire::AppendResponse response;
     brpc::Controller controller;
     auto request = append_request(id, offset, data.size(), wait_timeout_ms);
+    request.set_pg_epoch(impl_->pg_epoch);
     prepare_append(controller, data, impl_->timeout_ms, wait_timeout_ms);
     impl_->stub.Append(&controller, &request, &response, nullptr);
     return append_result(controller, response, offset, data.size());
@@ -183,13 +210,14 @@ ChunkClient::ReadResult ChunkClient::read_with_state(std::string_view id, std::u
     wire::ReadResponse response;
     brpc::Controller controller;
     request.set_chunk_id(std::string(id));
+    request.set_pg_epoch(impl_->pg_epoch);
     request.set_offset(offset);
     request.set_length(length);
     impl_->stub.ReadChunk(&controller, &request, &response, nullptr);
     check_read_response(controller, response, length);
     butil::IOBuf result;
     result.swap(controller.response_attachment());
-    return {std::move(result), response.has_frozen() && response.frozen()};
+    return {std::move(result), read_state(response)};
 }
 
 std::uint64_t ChunkClient::delete_chunk(std::string_view id) const {
@@ -197,6 +225,7 @@ std::uint64_t ChunkClient::delete_chunk(std::string_view id) const {
     wire::DeleteResponse response;
     brpc::Controller controller;
     request.set_chunk_id(std::string(id));
+    request.set_pg_epoch(impl_->pg_epoch);
     impl_->stub.DeleteChunk(&controller, &request, &response, nullptr);
     check_response(controller, response);
     return response.deleted_at_ns();
@@ -207,10 +236,11 @@ State ChunkClient::restore_chunk(std::string_view id, std::uint64_t deleted_at_n
     wire::RestoreResponse response;
     brpc::Controller controller;
     request.set_chunk_id(std::string(id));
+    request.set_pg_epoch(impl_->pg_epoch);
     request.set_deleted_at_ns(deleted_at_ns);
     impl_->stub.RestoreChunk(&controller, &request, &response, nullptr);
     check_response(controller, response);
-    return response.frozen() ? State::Frozen : State::Open;
+    return response_state(response);
 }
 
 std::uint64_t ChunkClient::freeze_chunk(std::string_view id) const {
@@ -218,6 +248,7 @@ std::uint64_t ChunkClient::freeze_chunk(std::string_view id) const {
     wire::FreezeResponse response;
     brpc::Controller controller;
     request.set_chunk_id(std::string(id));
+    request.set_pg_epoch(impl_->pg_epoch);
     impl_->stub.FreezeChunk(&controller, &request, &response, nullptr);
     check_response(controller, response);
     return response.length();
@@ -228,6 +259,7 @@ std::uint64_t ChunkClient::freeze_chunk(std::string_view id, std::uint64_t expec
     wire::FreezeResponse response;
     brpc::Controller controller;
     request.set_chunk_id(std::string(id));
+    request.set_pg_epoch(impl_->pg_epoch);
     request.set_expected_length(expected_length);
     impl_->stub.FreezeChunkAtLength(&controller, &request, &response, nullptr);
     check_response(controller, response);
@@ -235,8 +267,20 @@ std::uint64_t ChunkClient::freeze_chunk(std::string_view id, std::uint64_t expec
     return response.length();
 }
 
+std::uint64_t ChunkClient::seal_chunk(std::string_view id, std::uint64_t recovery_token,
+                                     std::optional<std::uint64_t> expected_length) const {
+    if (!recovery_token) throw std::invalid_argument("SealChunk requires a recovery token");
+    wire::SealChunkRequest request; wire::SealResponse response; brpc::Controller controller;
+    request.set_chunk_id(std::string(id)); request.set_recovery_token(recovery_token);
+    if (expected_length) request.set_expected_length(*expected_length);
+    impl_->stub.SealChunk(&controller, &request, &response, nullptr);
+    check_response(controller, response);
+    if (expected_length && response.length() != *expected_length) throw RpcError(EPROTO, "seal response length mismatch");
+    return response.length();
+}
+
 namespace {
-std::string describe(State state) { return state == State::Open ? "open" : "frozen"; }
+std::string describe(State state) { return std::string(state_name(state)); }
 std::string describe(std::uint64_t length) { return std::to_string(length); }
 
 std::string describe_replies(const std::vector<ReplicaReply>& replies, std::string message) {
@@ -340,7 +384,7 @@ butil::IOBuf ReplicatedChunkClient::read_chunk(std::string_view id, std::uint64_
     std::exception_ptr first_error;
     try {
         first = nodes_.front().client->read_with_state(id, offset, length);
-        if (first.frozen || nodes_.size() == 1) return std::move(first.data);
+        if (first.closed() || nodes_.size() == 1) return std::move(first.data);
     } catch (...) {
         first_error = std::current_exception();
     }
@@ -363,7 +407,7 @@ butil::IOBuf ReplicatedChunkClient::read_chunk(std::string_view id, std::uint64_
                 auto batch = std::move(owner);
                 try {
                     check_read_response(controller, response, batch->request.length());
-                    result.frozen = response.has_frozen() && response.frozen();
+                    result.state = read_state(response);
                     result.data.swap(controller.response_attachment());
                 } catch (...) {
                     error = std::current_exception();
@@ -387,6 +431,7 @@ butil::IOBuf ReplicatedChunkClient::read_chunk(std::string_view id, std::uint64_
     };
     const auto batch = std::make_shared<Batch>(nodes_.size());
     batch->request.set_chunk_id(std::string(id));
+    batch->request.set_pg_epoch(nodes_.front().client->impl_->pg_epoch);
     batch->request.set_offset(offset);
     batch->request.set_length(length);
     batch->calls.front().result = std::move(first);
@@ -427,7 +472,7 @@ butil::IOBuf ReplicatedChunkClient::read_chunk(std::string_view id, std::uint64_
             call.consumed = true;
             --remaining;
             if (call.error) continue;
-            if (call.result.frozen) return std::move(call.result.data);
+            if (call.result.closed()) return std::move(call.result.data);
             const auto match = std::find_if(votes.begin(), votes.end(), [&](const Vote& vote) {
                 return batch->calls[vote.representative].result.data.equals(call.result.data);
             });
@@ -467,6 +512,7 @@ std::vector<ReplicaReadResult> ReplicatedChunkClient::read_replicas(
     }
     wire::ReadRequest request;
     request.set_chunk_id(std::string(id));
+    request.set_pg_epoch(nodes_.front().client->impl_->pg_epoch);
     request.set_offset(offset);
     request.set_length(length);
     struct Call {
@@ -495,6 +541,7 @@ std::vector<ReplicaReadResult> ReplicatedChunkClient::read_replicas(
         call.join();
         try {
             check_read_response(call.controller, call.response, length);
+            reply.state = read_state(call.response);
             if (call.response.has_frozen()) reply.frozen = call.response.frozen();
             reply.data.swap(call.controller.response_attachment());
         } catch (...) {
@@ -532,6 +579,7 @@ AppendResult ReplicatedChunkClient::append(std::string_view id, std::uint64_t of
         ~Call() { join(); }
     };
     auto request = append_request(id, offset, data.size(), wait_timeout_ms);
+    request.set_pg_epoch(nodes_.front().client->impl_->pg_epoch);
     std::vector<Call> calls(nodes_.size());
     for (std::size_t i = 0; i < nodes_.size(); ++i) {
         prepare_append(calls[i].controller, data, nodes_[i].client->impl_->timeout_ms, wait_timeout_ms);
