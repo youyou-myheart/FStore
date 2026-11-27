@@ -11,7 +11,7 @@
 
 namespace chunkstore {
 enum class PGMode : unsigned { Active, Source, Target, Retired };
-enum class PGAccess { Read, Append, Freeze, Seal, Namespace, Snapshot, Repair };
+enum class PGAccess { Read, Append, Freeze, Seal, Namespace, Snapshot, Repair, Sync };
 struct PGChunk { std::string id; State state; };
 struct PGPage {
     std::vector<PGChunk> chunks;

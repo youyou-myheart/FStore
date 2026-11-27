@@ -17,6 +17,16 @@ public:
     bool frozen = true, has_state = true;
     std::optional<wire::CloseReason> reason = wire::PG_REPAIR;
     std::atomic<unsigned> reads{0};
+    std::atomic<std::uint64_t> sync_length{0}, sync_epoch{0}, sync_expected{0};
+    std::atomic<bool> sync_has_expected{false}, sync_has_status{true};
+    void SyncChunk(google::protobuf::RpcController*, const wire::SyncRequest* request,
+                   wire::SyncResponse* response, google::protobuf::Closure* done) override {
+        brpc::ClosureGuard guard(done);
+        sync_epoch = request->pg_epoch(); sync_has_expected = request->has_expected_length();
+        sync_expected = request->expected_length();
+        if (sync_has_status) response->mutable_status();
+        response->set_length(sync_length);
+    }
     void ReadChunk(google::protobuf::RpcController* call, const wire::ReadRequest* request,
                    wire::ReadResponse* response, google::protobuf::Closure* done) override {
         brpc::ClosureGuard guard(done); ++reads; response->mutable_status();
@@ -78,5 +88,19 @@ void seal_page() {
     wire::PGInventoryResponse last; seal_pg(store, request, last);
     unit::check(last.open_count() == 0 && !last.has_next_chunk() && last.chunks(0).close_reason() == wire::PG_REPAIR, "last seal page did not close PG");
 }
+void sync_response_validation() {
+    Node node;
+    ClientOptions options; options.pg_epoch = 19;
+    ChunkClient client(node.endpoint(), options);
+    const std::string id(30, '1');
+    unit::check(client.sync_chunk(id, 0) == 0 && node.reply.sync_has_expected && node.reply.sync_expected == 0 &&
+                node.reply.sync_epoch == 19, "sync lost zero expected length or epoch");
+    node.reply.sync_length = 7;
+    unit::check(client.sync_chunk(id) == 7 && !node.reply.sync_has_expected, "unconditional sync lost length");
+    unit::expect<RpcError>([&] { client.sync_chunk(id, 8); });
+    node.reply.sync_has_status = false;
+    unit::expect<RpcError>([&] { client.sync_chunk(id); });
 }
-int main() { return unit::run({{"SDK close state and compatibility", verify}, {"SealPG page state and counts", seal_page}}); }
+}
+int main() { return unit::run({{"SDK close state and compatibility", verify}, {"SealPG page state and counts", seal_page},
+    {"SyncChunk response validation and request fields", sync_response_validation}}); }

@@ -303,7 +303,11 @@ void read_exact(int fd, std::uint64_t offset, std::span<char> output) {
 } // namespace
 
 struct ChunkStore::Impl {
-    Impl(const fs::path& directory, std::uint64_t rate) : root(fs::canonical(directory)), traffic(rate) {
+    Impl(const fs::path& directory, std::uint64_t rate, AppendSync sync)
+        : root(fs::canonical(directory)), append_sync(sync), traffic(rate) {
+        if (sync != AppendSync::Always && sync != AppendSync::None) {
+            throw std::invalid_argument("invalid append sync policy");
+        }
         root_file.open(root, O_RDONLY | O_DIRECTORY);
         if (::flock(root_file.get(), LOCK_EX | LOCK_NB) < 0) {
             system_failure("lock storage directory");
@@ -407,6 +411,7 @@ struct ChunkStore::Impl {
     };
 
     fs::path root;
+    const AppendSync append_sync;
     std::unique_ptr<PGInventory> inventory;
     File root_file;
     std::array<std::once_flag, 256> shards;
@@ -452,8 +457,8 @@ struct ChunkStore::Impl {
     std::jthread cleaner;
 };
 
-ChunkStore::ChunkStore(const fs::path& directory, std::uint64_t rate)
-    : impl_(std::make_unique<Impl>(directory, rate)) {}
+ChunkStore::ChunkStore(const fs::path& directory, std::uint64_t rate, AppendSync append_sync)
+    : impl_(std::make_unique<Impl>(directory, rate, append_sync)) {}
 
 TrafficLimiter& ChunkStore::traffic() { return impl_->traffic; }
 PGInventory& ChunkStore::inventory() { return *impl_->inventory; }
@@ -711,9 +716,29 @@ void ChunkStore::append_group(std::string_view id, std::span<AppendGroupItem> re
             }
         }
     }
-    sync_file(chunk.version->file.get(), true);
+    if (impl_->append_sync == AppendSync::Always) sync_file(chunk.version->file.get(), true);
     chunk.version->length.store(end, std::memory_order_release);
     chunk.write_failed = false;
+}
+
+std::uint64_t ChunkStore::sync_chunk(std::string_view id, std::optional<std::uint64_t> expected_length,
+                                    std::uint64_t epoch) {
+    auto pg_guard = impl_->inventory->guard(id, epoch, PGAccess::Sync);
+    const auto handle = impl_->find(id);
+    auto& chunk = *handle;
+    std::lock_guard lock(chunk.writer);
+    chunk.check_writable();
+    if (!chunk.version) system_failure("chunk not found", ENOENT);
+    const auto length = chunk.version->length.load(std::memory_order_relaxed);
+    if (expected_length && length != *expected_length) {
+        throw LengthMismatch("expected length " + std::to_string(*expected_length) +
+                             ", stored length " + std::to_string(length));
+    }
+    // Do not turn a previous failed write/sync into a successful acknowledgement.
+    chunk.write_failed = true;
+    sync_file(chunk.version->file.get(), true);
+    chunk.write_failed = false;
+    return length;
 }
 
 State ChunkStore::read_chunk(std::string_view id, std::uint64_t offset,

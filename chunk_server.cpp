@@ -333,6 +333,15 @@ public:
                         counted, TrafficLane::Online, data.size());
     }
 
+    void SyncChunk(google::protobuf::RpcController* controller, const rpc::SyncRequest* request,
+                   rpc::SyncResponse* response, google::protobuf::Closure* done) override {
+        submit(controller, done, *response->mutable_status(), [this, request, response] {
+            response->set_length(store_.sync_chunk(request->chunk_id(),
+                request->has_expected_length() ? std::optional<std::uint64_t>(request->expected_length()) : std::nullopt,
+                request->pg_epoch()));
+        }, &request->chunk_id());
+    }
+
     void ReadChunk(google::protobuf::RpcController* controller, const rpc::ReadRequest* request,
                    rpc::ReadResponse* response, google::protobuf::Closure* done) override {
         auto& status = *response->mutable_status();
@@ -865,6 +874,7 @@ int main(int argc, char** argv) {
     if (argc < 2 || options_begin > 5) {
         std::cerr << "usage: chunk_server DATA_DIR [ADDRESS:PORT [MAX_CONCURRENCY [RATE_MIB_S]]]"
                      " [--worker-poll=sleep|<N>us|busy] [--poll-workers=N]"
+                     " [--append-sync=always|none]"
                      " [--server-id=ID [--advertise=HOST:PORT]]\n";
         return EXIT_FAILURE;
     }
@@ -892,15 +902,23 @@ int main(int argc, char** argv) {
     try {
         std::optional<std::string> server_id;
         std::optional<std::string> advertised_endpoint;
+        std::optional<chunkstore::AppendSync> append_sync;
         std::vector<char*> polling_arguments;
         for (int i = options_begin; i < argc; ++i) {
             const std::string_view argument = argv[i];
             constexpr std::string_view id_flag = "--server-id=";
             constexpr std::string_view advertise_flag = "--advertise=";
+            constexpr std::string_view sync_flag = "--append-sync=";
             if (argument.starts_with(id_flag) && !server_id) {
                 server_id = argument.substr(id_flag.size());
             } else if (argument.starts_with(advertise_flag) && !advertised_endpoint) {
                 advertised_endpoint = argument.substr(advertise_flag.size());
+            } else if (argument.starts_with(sync_flag)) {
+                if (append_sync) throw std::invalid_argument("duplicate --append-sync");
+                const auto value = argument.substr(sync_flag.size());
+                if (value == "always") append_sync = chunkstore::AppendSync::Always;
+                else if (value == "none") append_sync = chunkstore::AppendSync::None;
+                else throw std::invalid_argument("--append-sync expects always or none");
             } else {
                 polling_arguments.push_back(argv[i]);
             }
@@ -918,7 +936,9 @@ int main(int argc, char** argv) {
         const auto workers = std::min(static_cast<unsigned>(concurrency),
             4 * std::clamp(std::thread::hardware_concurrency(), 4u, 16u));
         const auto polling = parse_polling(polling_arguments, workers);
-        chunkstore::ChunkStore store(argv[1], rate);
+        const auto sync = append_sync.value_or(chunkstore::AppendSync::Always);
+        chunkstore::ChunkStore store(argv[1], rate, sync);
+        std::cerr << "append-sync=" << (sync == chunkstore::AppendSync::Always ? "always" : "none (page-cache acknowledgement)") << '\n';
         Service service(store, workers, static_cast<unsigned>(concurrency), polling);
         std::unique_ptr<chunkstore::FServerStatusService> heartbeat;
         if (server_id) {

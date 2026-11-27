@@ -47,6 +47,8 @@ FMaster 主动调用每台 FServer 的状态接口。集成测试同时运行两
 
 ## 存储与多副本
 
+`append_sync` UT 在真实文件操作周围记录同步调用，验证默认批量同步、`none` 追加不调用同步、立即可读、容量拒绝、写入/同步失败不确认，以及关闭、创建、修复安装和目录变更仍然同步。还覆盖显式 SyncChunk 必须调用 fdatasync、可继续追加、重复同步、精确长度检查、Frozen/Sealed 状态保留、epoch/PG fence、同步失败阻止后续修改，以及并发追加不能越过正在执行的同步。`append_sync_rpc` 验证默认和显式两种启动策略、非法/重复参数、乱序追加、容量检查、Freeze 和节点间修复，并覆盖单节点/多副本 sync 命令、返回长度不一致、部分副本缺失、补齐后重试和缺口未填时的同步范围。`chunk_closure_rpc` 检查 SyncChunk 的 SDK 请求字段及错误响应，`space_integration` 覆盖 SpaceChunk.sync。这些测试不模拟整机掉电，也不把进程重启当作页缓存数据的持久性证明。
+
 `chunk_closure` UT 覆盖 USER_FREEZE / PG_REPAIR 区分、首次关闭原因不被交叉调用覆盖、并发 Freeze/Seal、缺失或错误 token、长度校验、重启扫描、删除恢复、修复原子替换原因、旧文件兼容、rename 前残留属性和损坏原因拒绝。`chunk_closure_rpc` 通过受控 bRPC 回复验证单节点及逐副本 SDK 的细分状态、Sealed 的只读快速读取、旧回复兼容与非法枚举/矛盾字段拒绝。
 
 `pg_recovery` 还检查 33 个真实 Chunk 的两种关闭原因，在存活源和新目标上的文件属性均一致；覆盖 SOURCE fence 下单 Chunk Seal RPC 的 token 校验、源和目标 SIGKILL 后重启、Sealed 的追加错误码、删除恢复和 SDK 细分状态。

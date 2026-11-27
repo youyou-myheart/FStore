@@ -54,6 +54,8 @@ public:
     AppendResult append(std::string_view id, std::uint64_t offset,
                         const butil::IOBuf& data, std::uint32_t wait_timeout_ms) const;
     butil::IOBuf read_chunk(std::string_view id, std::uint64_t offset, std::size_t length) const;
+    // Explicit durable barrier; does not close the Chunk or wait for missing appends.
+    std::uint64_t sync_chunk(std::string_view id, std::optional<std::uint64_t> expected_length = std::nullopt) const;
     std::uint64_t delete_chunk(std::string_view id) const;
     State restore_chunk(std::string_view id, std::uint64_t deleted_at_ns) const;
     std::uint64_t freeze_chunk(std::string_view id) const;
@@ -111,6 +113,8 @@ public:
     AppendResult append(std::string_view id, std::uint64_t offset, const butil::IOBuf& data,
                         std::uint32_t wait_timeout_ms) const;
     std::uint64_t freeze_chunk(std::string_view id, std::uint64_t expected_length) const;
+    // All replicas must sync successfully and report the same durable length.
+    std::uint64_t sync_chunk(std::string_view id, std::optional<std::uint64_t> expected_length = std::nullopt) const;
     // One immutable (frozen/sealed) reply or a strict majority of identical reads.
     butil::IOBuf read_chunk(std::string_view id, std::uint64_t offset, std::size_t length) const;
     // Read every replica concurrently, retaining every result in endpoint order.

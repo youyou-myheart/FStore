@@ -98,6 +98,15 @@ message FreezeResponse {
   Status status = 1;
   uint64 length = 2;
 }
+message SyncRequest {
+  string chunk_id = 1;
+  optional uint64 expected_length = 2; // Exact length check under the Chunk writer lock.
+  uint64 pg_epoch = 15;
+}
+message SyncResponse {
+  Status status = 1;
+  uint64 length = 2; // Durable prefix [0, length); the Chunk state is unchanged.
+}
 message SealResponse { Status status = 1; uint64 length = 2; }
 
 message FreezeAtLengthRequest {
@@ -168,6 +177,7 @@ service ChunkService {
   rpc ReceiveRepairBlock(RepairBlock) returns (RepairResponse);
   rpc CreateChunk(CreateRequest) returns (CreateResponse);
   rpc Append(AppendRequest) returns (AppendResponse);
+  rpc SyncChunk(SyncRequest) returns (SyncResponse);
   rpc ReadChunk(ReadRequest) returns (ReadResponse);
   rpc DeleteChunk(ChunkRequest) returns (DeleteResponse);
   rpc RestoreChunk(RestoreRequest) returns (RestoreResponse);

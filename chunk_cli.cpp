@@ -91,7 +91,7 @@ int main(int argc, char** argv) {
                        (command == "pg-chunks" && argc >= 4 && argc <= 6) ||
                        ((command == "create" || command == "restore") && argc == 5) ||
                        (command == "repair" && (argc == 5 || argc == 6)) ||
-                       (command == "freeze" && (argc == 4 || argc == 5)) || (command == "delete" && argc == 4) ||
+                       ((command == "freeze" || command == "sync") && (argc == 4 || argc == 5)) || (command == "delete" && argc == 4) ||
                        (command == "append" && argc == 7) || (command == "read" && argc == 6);
     if (!valid) {
         std::cerr << "usage: chunk_cli ENDPOINT create ID CAPACITY_BYTES\n"
@@ -106,6 +106,7 @@ int main(int argc, char** argv) {
                      "       chunk_cli ENDPOINT pgs [START [LIMIT]]\n"
                      "       chunk_cli ENDPOINT pg-chunks PG_ID [AFTER_CHUNK [LIMIT]]\n"
                      "       chunk_cli ENDPOINT freeze ID [EXPECTED_LENGTH]\n"
+                     "       chunk_cli ENDPOINT[,ENDPOINT...] sync ID [EXPECTED_LENGTH]\n"
                      "       chunk_cli HOST:PORT,HOST:PORT,... create ID CAPACITY_BYTES\n"
                      "       chunk_cli HOST:PORT,HOST:PORT,... append ID OFFSET WAIT_MS FILE|-\n"
                      "       chunk_cli HOST:PORT,HOST:PORT,... freeze ID EXPECTED_LENGTH\n"
@@ -116,11 +117,12 @@ int main(int argc, char** argv) {
     try {
         const std::string_view endpoints = argv[1];
         if (endpoints.find(',') != endpoints.npos) {
-            if (command != "append" && command != "create" && command != "read" && !(command == "freeze" && argc == 5)) {
-                throw std::invalid_argument("replica list supports create, append, read and freeze ID EXPECTED_LENGTH");
+            if (command != "append" && command != "create" && command != "read" && command != "sync" && !(command == "freeze" && argc == 5)) {
+                throw std::invalid_argument("replica list supports create, append, read, sync and freeze ID EXPECTED_LENGTH");
             }
             chunkstore::ReplicatedChunkClient client(split_replicas(endpoints), options);
             if (command == "read") read_chunk(client, argv);
+            else if (command == "sync") std::cout << client.sync_chunk(argv[3], argc == 5 ? std::optional<std::uint64_t>(number(argv[4])) : std::nullopt) << '\n';
             else write_chunk(client, command, argv);
             std::cout.flush();
             return std::cout ? EXIT_SUCCESS : EXIT_FAILURE;
@@ -149,7 +151,9 @@ int main(int argc, char** argv) {
             return std::cout ? EXIT_SUCCESS : EXIT_FAILURE;
         }
         const auto* id = argv[3];
-        if (command == "state") {
+        if (command == "sync") {
+            std::cout << client.sync_chunk(id, argc == 5 ? std::optional<std::uint64_t>(number(argv[4])) : std::nullopt) << '\n';
+        } else if (command == "state") {
             const auto read = client.read_with_state(id, 0, 0);
             std::cout << (read.state ? chunkstore::state_name(*read.state) : "unknown") << '\n';
         } else if (command == "seal") {

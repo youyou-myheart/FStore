@@ -23,6 +23,7 @@ int main(int argc, char** argv) {
         chunk.create();
         const std::string payload(4096, 'x');
         chunk.append(0, payload, 1000);
+        if (chunk.sync(payload.size()) != payload.size() || chunk.sync() != payload.size()) throw std::runtime_error("SpaceChunk sync failed");
         if (chunk.read(0, payload.size()).to_string() != payload) throw std::runtime_error("quorum read mismatch");
         const auto replicas = chunk.read_replicas(0, payload.size());
         if (replicas.size() != chunk.route().space().spec().replicas()) throw std::runtime_error("missing replica");

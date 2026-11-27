@@ -15,7 +15,37 @@ mkdir -p data
 
 服务位置参数为 `DATA_DIR [ADDRESS:PORT [MAX_CONCURRENCY [RATE_MIB_S]]]`，默认 `127.0.0.1:8080` 、64 个并发在线 RPC 和 256 MiB/s 的节点总额度。磁盘操作在独立工作线程池执行。Chunk 接口只接受 `baidu_std`，bRPC 内置服务已关闭。
 
-服务端按 Chunk 调度写请求。每次最多合并 32 个偏移连续的追加请求，合计最多 8 MiB，共用一次落盘同步。创建、封存、删除和恢复作为批次边界。每个请求独立检查剩余容量并返回各自的偏移。
+服务端按 Chunk 调度写请求。每次最多合并 32 个偏移连续的追加请求，合计最多 8 MiB，默认共用一次落盘同步。创建、显式同步、封存、删除和恢复作为批次边界。每个请求独立检查剩余容量并返回各自的偏移。
+
+追加同步策略由节点启动参数 `--append-sync=always|none` 控制，默认 `always`：
+
+```sh
+./build/chunk_server data 127.0.0.1:8080 128 4096 --append-sync=always
+./build/chunk_server data 127.0.0.1:8080 128 4096 --append-sync=none
+```
+
+| 策略 | 追加成功的含义 |
+|---|---|
+| `always`（默认） | 每个有有效数据的追加批次在 `pwritev` 完成后执行一次 `fdatasync`，同步成功才发布长度并确认。 |
+| `none` | 所有字节写入内核页缓存后发布长度并确认，跳过追加批次的 `fdatasync`。已确认数据立即可读，但机器掉电或内核崩溃可能丢失。 |
+
+`none` 没有定时同步线程或固定的数据丢失窗口；内核仍会自行回写脏页。普通进程退出或 SIGKILL 通常不会清空内核页缓存，因此进程重启测试不能证明掉电持久性。此参数不改变容量限制、乱序等待、批量顺序、PG 隔离和写入错误处理，也不会关闭创建、Freeze/Seal、修复安装、PG 控制和目录元数据的同步。Freeze/Seal 成功前仍会同步整个 Chunk，修复只发送已封存数据。删除只保证目录变更持久化，不会把此前 `none` 追加的确认升级为持久化确认。
+
+策略只在启动时生效，并写入启动日志。SDK/RPC 不覆盖节点配置；多副本追加成功表示各节点按自己的策略完成，所有副本都使用 `none` 时不等于已经持久化。C++ 本地 API 可通过构造函数第三个参数 `chunkstore::AppendSync::None` 选择相同策略。
+
+`SyncChunk` 提供显式持久化：在同一 Chunk 的写锁内执行 `fdatasync`，成功后返回当前文件已同步的字节长度 `L`，保证 `[0, L)` 已同步。它在两种追加策略下都执行同步，不改变 Open/Frozen/Sealed 状态、容量、PG 清单或路由版本，Open Chunk 可以继续追加。它经过在线限流队列和 Chunk 修改队列，与追加、关闭、删除和替换互斥。
+
+```sh
+# 同步当前长度，或者要求当前长度恰好为 4096
+./build/chunk_cli 127.0.0.1:8080 sync CHUNK_ID
+./build/chunk_cli 127.0.0.1:8080 sync CHUNK_ID 4096
+# 对所有副本发起同步；路由变更后可追加 --pg-epoch=N
+./build/chunk_cli 127.0.0.1:8080,127.0.0.1:8081,127.0.0.1:8082 sync CHUNK_ID 4096
+```
+
+C++ 使用 `client.sync_chunk(id, expected_length)`，单节点与多副本客户端都支持；省略长度则同步执行时的当前长度，`SpaceChunk` 对应 `chunk.sync(expected_length)`。多副本 SDK 并行同步所有副本，全部成功且返回长度一致才成功；任何副本失败或长度不一致都抛出包含逐副本结果的 `ReplicaCommitError`，不以读回数据代替同步确认。该操作不比较各副本的字节内容，也不补齐缺失数据。
+
+调用方应先等待所需追加请求成功，再调用 SyncChunk。网络请求尚未到达、或正在等待 offset 缺口的追加不在此次保证范围内。可选的 `expected_length` 在写锁内做精确检查，包括显式传入 0；不匹配返回 `LENGTH_MISMATCH`，不会等待未来追加或截断文件。同步失败返回错误，该 Chunk 后续修改和同步被阻止，沿用存储错误后的重启检查机制；RPC 超时表示结果未知。旧 epoch、TARGET/RETIRED PG 被拒绝，SOURCE PG 可同步已有数据。删除后重建或修复替换得到的新文件版本不继承此前返回长度的保证。
 
 ## FMaster 配置与状态管理
 
@@ -182,7 +212,7 @@ client.freeze_chunk(id, offset + length);
 
 - **创建**会检查每个副本的容量和返回状态。容量相同、状态一致的重复创建可成功。客户端拒绝解析到同一地址和端口的重复副本。调用方负责把地址映射到独立的存储节点。
 - **追加**向所有副本发送相同的偏移、数据和乱序等待时间。正常写入每个节点只需一次 RPC，多个 attachment 共享客户端的 `IOBuf` 数据块。多个线程可共用一个客户端，由调用方统一分配各 Chunk 的字节范围。
-- **部分失败**时，已落盘的字节继续保留且可读。CLI 返回非零并列出每台节点的结果，SDK 抛出 `ReplicaCommitError`，其 `replies()` 按地址输入顺序记录确认值或异常。传输错误表示结果未知。重试时使用相同的 Chunk ID、副本列表、偏移和原始数据。遇到已占用的偏移或已封存的副本，客户端会读回该范围，逐字节一致才计为确认。整个重试期间应保留同一代 Chunk，并保证每个偏移只分配给一份数据。
+- **部分失败**时，已写入的字节继续保留且可读，持久性取决于节点的追加同步策略。CLI 返回非零并列出每台节点的结果，SDK 抛出 `ReplicaCommitError`，其 `replies()` 按地址输入顺序记录确认值或异常。传输错误表示结果未知。重试时使用相同的 Chunk ID、副本列表、偏移和原始数据。遇到已占用的偏移或已封存的副本，客户端会读回该范围，逐字节一致才计为确认。整个重试期间应保留同一代 Chunk，并保证每个偏移只分配给一份数据。
 - **封存**时传入已提交的最终长度。每个节点在写锁内核对自己的长度，相符才封存。落后的副本可补写后重试，已按该长度封存的副本会重复确认。此操作使用新增的 `FreezeChunkAtLength` RPC，多副本封存前须升级对应节点。
 
 多副本 SDK 提供两种读取语义，都按 `offset` 和 `length` 指定范围。
@@ -207,6 +237,7 @@ const auto replicas = client.read_replicas(id, offset, length);
 |---|---|---|
 | `CreateChunk` | Chunk ID、容量（字节） | 当前封存状态和容量，同 ID 同容量可重复调用 |
 | `Append` | Chunk ID、预期字节偏移、字节数、等待超时（毫秒）、请求 attachment | 起始偏移和追加长度 |
+| `SyncChunk` | Chunk ID、可选预期当前长度、PG epoch | 已同步的当前字节长度，Chunk 状态不变 |
 | `ReadChunk` | Chunk ID、偏移、长度 | 响应 attachment 中的原始字节 |
 | `FreezeChunk` | Chunk ID | 最终字节长度，重复封存返回相同长度 |
 | `FreezeChunkAtLength` | Chunk ID、预期最终字节长度 | 长度匹配时封存并返回长度，长度有差异时返回 `LENGTH_MISMATCH` |
@@ -214,7 +245,7 @@ const auto replicas = client.read_replicas(id, offset, length);
 | `DeleteChunk` | Chunk ID | 本次删除的 Unix 纳秒时间戳，用于恢复 |
 | `RestoreChunk` | Chunk ID、删除时间戳 | 恢复后的 Open、Frozen 或 Sealed 状态 |
 
-协议定义见 `chunk.proto`。Chunk ID 为 120 位（`seq_id:48 | space_id:8 | index:64`），使用 30 位小写十六进制字符串。仅 index 的固定哈希决定全局 PG，同一 Blob 共用序号；底层接口兼容已有的 24/32 位十六进制 ID。单次追加、读取各限 8 MiB。小记录可以用 `butil::IOBuf` 拼成一个请求，共用一次落盘同步。追加在同步成功后才返回。客户端用 `RpcError` 表示 RPC 调用失败，用 `RemoteChunkError` 表示服务端业务错误。
+协议定义见 `chunk.proto`。Chunk ID 为 120 位（`seq_id:48 | space_id:8 | index:64`），使用 30 位小写十六进制字符串。仅 index 的固定哈希决定全局 PG，同一 Blob 共用序号；底层接口兼容已有的 24/32 位十六进制 ID。单次追加、读取各限 8 MiB。小记录可以用 `butil::IOBuf` 拼成一个请求。默认追加在同步成功后才返回；`--append-sync=none` 在写入内核页缓存后返回，见启动参数说明。客户端用 `RpcError` 表示 RPC 调用失败，用 `RemoteChunkError` 表示服务端业务错误。
 
 容量必须为正数，创建后固定。容量保存在 Chunk 文件的 Linux 扩展属性中，存储文件系统必须支持 `user.*` 扩展属性。文件长度随写入增长。恰好写满时追加成功，超过剩余容量的请求整批返回 `CHUNK_FULL`。同 ID 使用不同容量创建会返回 `CAPACITY_MISMATCH`。
 
@@ -224,7 +255,7 @@ const auto replicas = client.read_replicas(id, offset, length);
 
 每次 `Append` 必须带 `offset` 和 `wait_timeout_ms`，且数据不能为空。调用方按字节分配偏移。例如先发送偏移 5，再并发发送偏移 0 的 5 字节数据。服务端只写从当前长度开始的连续范围，会把两段放在同一批中（受批次上限约束）。C++ 调用是同步的，可以在多个线程共享同一个客户端发送。CLI 用法为 `append ID OFFSET WAIT_MS FILE|-`。
 
-- 等待超时范围为 0 到 60,000 ms，从请求进入服务端追加处理开始计时。0 表示有缺口时立即返回。请求在进入写入批次前到期会被丢弃，并返回 `GAP_TIMEOUT`。已经进入批次的请求等待落盘完成。
+- 等待超时范围为 0 到 60,000 ms，从请求进入服务端追加处理开始计时。0 表示有缺口时立即返回。请求在进入写入批次前到期会被丢弃，并返回 `GAP_TIMEOUT`。已经进入批次的请求等待按配置策略完成写入。
 - 已覆盖的偏移返回 `OFFSET_CONFLICT`，超过 Chunk 容量返回 `CHUNK_FULL`。成功封存会结束该 Chunk 未补齐的追加，返回 `FROZEN`。
 - 服务端最多将约一半的并发额度用于等待缺口，留出额度接收补齐请求。等待队列满时返回 `WRITE_UNAVAILABLE`。
 - C++ 客户端把调用超时设为默认 RPC 超时加本次等待时间，并关闭自动重试。收到 `GAP_TIMEOUT` 可确认该请求未写入。传输超时或断连时结果仍未知，可按原偏移核对数据。重启后按文件长度恢复下一可写偏移，未落盘的等待请求随进程退出而丢失。
@@ -263,7 +294,7 @@ const auto replicas = client.read_replicas(id, offset, length);
 | 多副本追加 | 客户端直接发出多个异步 bRPC 调用，共享请求数据块，收齐结果后再返回。正常提交省去为每个副本启动和回收 bthread 的开销。 |
 | 修复 | 优先级之间可并行校验、写块和同步文件。接收端用会话锁登记和清理传输，在分块写入和文件同步前释放该锁。 |
 
-同一 Chunk 的修改保留写锁，追加仍在 `fdatasync` 成功后发布长度并确认。文件系统、bRPC 内部和空闲等待也有各自的同步机制。
+同一 Chunk 的修改保留写锁，默认追加在 `fdatasync` 成功后发布长度并确认；`--append-sync=none` 则在完整写入页缓存后发布。文件系统、bRPC 内部和空闲等待也有各自的同步机制。
 
 120 位 Chunk 的数据操作还持有 PG 级共享隔离锁，使恢复切换能等待已经进入存储层的操作完成。每线程缓存最近访问的 PG，命中时避开全局 PG 索引锁；心跳中的 Chunk 总数通过原子计数读取。PG 成员清单只在成员或冻结状态改变时更新，普通追加和读取不修改清单。本实现不是全链路无锁。
 

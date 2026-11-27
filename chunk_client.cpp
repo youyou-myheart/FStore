@@ -198,6 +198,19 @@ AppendResult ChunkClient::append(std::string_view id, std::uint64_t offset,
     return append_result(controller, response, offset, data.size());
 }
 
+std::uint64_t ChunkClient::sync_chunk(std::string_view id, std::optional<std::uint64_t> expected_length) const {
+    wire::SyncRequest request;
+    wire::SyncResponse response;
+    brpc::Controller controller;
+    request.set_chunk_id(std::string(id));
+    request.set_pg_epoch(impl_->pg_epoch);
+    if (expected_length) request.set_expected_length(*expected_length);
+    impl_->stub.SyncChunk(&controller, &request, &response, nullptr);
+    check_response(controller, response);
+    if (expected_length && response.length() != *expected_length) throw RpcError(EPROTO, "sync response length mismatch");
+    return response.length();
+}
+
 butil::IOBuf ChunkClient::read_chunk(std::string_view id, std::uint64_t offset,
                                       std::size_t length) const {
     return read_with_state(id, offset, length).data;
@@ -553,6 +566,10 @@ std::vector<ReplicaReadResult> ReplicatedChunkClient::read_replicas(
 
 State ReplicatedChunkClient::create_chunk(std::string_view id, std::uint64_t capacity) const {
     return commit([&](const ChunkClient& client, std::size_t) { return client.create_chunk(id, capacity); });
+}
+
+std::uint64_t ReplicatedChunkClient::sync_chunk(std::string_view id, std::optional<std::uint64_t> expected_length) const {
+    return commit([&](const ChunkClient& client, std::size_t) { return client.sync_chunk(id, expected_length); });
 }
 
 AppendResult ReplicatedChunkClient::append(std::string_view id, std::uint64_t offset,

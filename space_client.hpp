@@ -29,6 +29,9 @@ public:
     std::uint64_t freeze(std::uint64_t expected_length) const {
         return replicas_->freeze_chunk(id(), expected_length);
     }
+    std::uint64_t sync(std::optional<std::uint64_t> expected_length = std::nullopt) const {
+        return replicas_->sync_chunk(id(), expected_length);
+    }
 private:
     friend class SpaceClient;
     SpaceChunk(master::wire::ChunkRoute route, std::shared_ptr<ReplicatedChunkClient> replicas);
